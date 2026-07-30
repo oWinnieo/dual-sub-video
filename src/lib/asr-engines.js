@@ -19,6 +19,12 @@
 async function transcribeWithLocalEngine(file, { language, quality, mediaPath, samplePath, onProgress }) {
   const lang = language === 'detect' ? 'auto' : language;
   let request;
+  console.log('[Transcription] Request started', {
+    language: lang,
+    quality,
+    source: mediaPath ? 'desktop-path' : samplePath ? 'sample' : file ? 'browser-upload' : 'missing',
+    fileName: file?.name || (mediaPath ? mediaPath.split(/[\\/]/).pop() : samplePath || null),
+  });
 
   if (mediaPath || samplePath) {
     onProgress?.(0.08, mediaPath ? 'Sending desktop path to local engine' : 'Running sample smoke test');
@@ -54,6 +60,13 @@ async function transcribeWithLocalEngine(file, { language, quality, mediaPath, s
   }
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
+    console.error('[Transcription] Failed', {
+      status: res.status,
+      code: data.code || null,
+      message: data.error || `Local transcription failed (${res.status}).`,
+      rejectedHallucinations: data.rejectedHallucinations || 0,
+      job: data.job || null,
+    });
     const err = new Error(data.error || `Local transcription failed (${res.status}).`);
     err.code = data.code || null;
     err.status = res.status;

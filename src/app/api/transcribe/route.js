@@ -125,12 +125,26 @@ export async function POST(request) {
     }
 
     job = { ...job, stage: 'local-pipeline', logPath: path.join(status.paths.logsDir, `${jobId}.log`) };
-    const { cues, detectedLanguage, plan, stages } = await runWhisperJob({ mediaPath, language, quality, jobId });
+    const {
+      cues,
+      detectedLanguage,
+      rejectedHallucinations,
+      plan,
+      stages,
+    } = await runWhisperJob({ mediaPath, language, quality, jobId });
     job = { ...job, stage: 'parsing-cues', logPath: plan.logPath, stages };
 
     if (!cues.length) {
+      const hallucinationOnly = rejectedHallucinations > 0;
       return NextResponse.json(
-        { error: 'No speech was detected in this file. Check the audio track or try a different source.', code: 'NO_SPEECH', job },
+        {
+          error: hallucinationOnly
+            ? `Whisper produced only repetitive text (${rejectedHallucinations} cue${rejectedHallucinations === 1 ? '' : 's'} rejected). Choose the spoken language explicitly or check whether the clip contains clear speech.`
+            : 'No speech was detected in this file. Check the audio track or try a different source.',
+          code: hallucinationOnly ? 'ASR_HALLUCINATION' : 'NO_SPEECH',
+          rejectedHallucinations,
+          job,
+        },
         { status: 422 },
       );
     }
@@ -138,6 +152,7 @@ export async function POST(request) {
     return NextResponse.json({
       cues,
       detectedLanguage,
+      rejectedHallucinations,
       engine: 'node-whisper',
       status,
       logPath: plan.logPath,

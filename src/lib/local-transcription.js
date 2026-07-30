@@ -373,6 +373,62 @@ function compactRepeatedWords(text) {
   return compact.join(' ');
 }
 
+export function whisperHallucinationReason(text) {
+  const normalizedText = String(text || '').normalize('NFKC').trim();
+  const compact = normalizedText
+    .replace(/[^\p{L}\p{N}]+/gu, '');
+  const characters = Array.from(compact);
+  const marker = normalizedText
+    .toLocaleLowerCase()
+    .replace(/[\s()[\]{}<>（）［］【】「」『』]/gu, '');
+  if (['笑', '笑い', 'laughter', 'laughs', 'music', '音楽', '拍手', 'applause'].includes(marker)) {
+    return 'the cue contains only a non-speech sound marker';
+  }
+  if (characters.length >= 5 && new Set(characters).size === 1) {
+    return 'the cue repeats only one character';
+  }
+  if (characters.length < 12) return null;
+
+  if (/(.)\1{7,}/u.test(compact)) {
+    return 'the same character repeats at least eight times';
+  }
+
+  const exactRepeatedUnit = compact.match(/^(.{1,4})\1{4,}$/u);
+  if (exactRepeatedUnit) {
+    return `a ${Array.from(exactRepeatedUnit[1]).length}-character pattern repeats throughout the cue`;
+  }
+
+  const frequencies = new Map();
+  for (const character of characters) {
+    frequencies.set(character, (frequencies.get(character) || 0) + 1);
+  }
+  const dominantCount = Math.max(...frequencies.values());
+  if (frequencies.size <= 3 && dominantCount / characters.length >= 0.7) {
+    return 'the cue is dominated by only a few repeated characters';
+  }
+
+  return null;
+}
+
+function inferLanguageFromScript(cues) {
+  const text = cues.map((cue) => cue.original).join(' ');
+  if (/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(text)) return 'ja';
+  if (/\p{Script=Hangul}/u.test(text)) return 'ko';
+  if (/[\p{Script=Han}]/u.test(text)) return 'zh';
+  return null;
+}
+
+function assessWhisperCues(cues) {
+  const assessed = cues.map((cue) => ({
+    cue,
+    reason: whisperHallucinationReason(cue.original),
+  }));
+  return {
+    accepted: assessed.filter((entry) => !entry.reason).map((entry) => entry.cue),
+    rejected: assessed.filter((entry) => entry.reason),
+  };
+}
+
 function audioWindows(samples) {
   const windowSamples = WINDOW_SECONDS * SAMPLE_RATE;
   const stepSamples = (WINDOW_SECONDS - WINDOW_OVERLAP_SECONDS) * SAMPLE_RATE;
@@ -449,6 +505,7 @@ async function recognizeAudio(plan) {
     stage: 'recognize',
     event: 'start',
     model: plan.model.id,
+    language: plan.language,
     durationSeconds,
     windows: windows.length,
   });
@@ -456,10 +513,16 @@ async function recognizeAudio(plan) {
   const options = {
     return_timestamps: true,
     max_new_tokens: MAX_NEW_TOKENS,
+    // Prevent Whisper from filling a low-information window with the same
+    // token indefinitely (for example, "チチチ…"). The post-generation
+    // hallucination filter remains the final safety net.
+    no_repeat_ngram_size: 5,
+    repetition_penalty: 1.1,
     task: 'transcribe',
   };
   if (plan.language !== 'auto') options.language = plan.language;
   const cues = [];
+  let rejectedHallucinations = 0;
   for (let index = 0; index < windows.length; index += 1) {
     const window = windows[index];
     const ownershipStart = index === 0
@@ -479,14 +542,60 @@ async function recognizeAudio(plan) {
     });
     // Transformers.js augments the options object with Whisper prompt tokens.
     // Each window needs a fresh object or the next call rejects that carried state.
-    const output = await recognizer(window.samples, { ...options });
+    let output = await recognizer(window.samples, { ...options });
     const windowDuration = window.samples.length / SAMPLE_RATE;
-    const rawWindowCues = transformerOutputToCues(output, windowDuration).map((cue, cueIndex) => ({
-      ...cue,
-      id: `node-whisper-${index + 1}-${cueIndex + 1}`,
-      start: cue.start + window.offsetSeconds,
-      end: cue.end + window.offsetSeconds,
-    }));
+    let modelWindowCues = transformerOutputToCues(output, windowDuration);
+    let assessment = assessWhisperCues(modelWindowCues);
+
+    // Transformers.js does not expose a reliable detected-language result.
+    // If auto mode produces only obvious garbage but its script gives us a
+    // strong hint, retry this window once with that language forced.
+    if (plan.language === 'auto' && assessment.accepted.length === 0 && assessment.rejected.length > 0) {
+      const inferredLanguage = inferLanguageFromScript(modelWindowCues);
+      if (inferredLanguage) {
+        appendJobLog(plan.logPath, {
+          stage: 'recognize',
+          event: 'auto-language-retry',
+          index: index + 1,
+          inferredLanguage,
+          rejectedBeforeRetry: assessment.rejected.length,
+        });
+        output = await recognizer(window.samples, { ...options, language: inferredLanguage });
+        modelWindowCues = transformerOutputToCues(output, windowDuration);
+        assessment = assessWhisperCues(modelWindowCues);
+        appendJobLog(plan.logPath, {
+          stage: 'recognize',
+          event: 'auto-language-retry-complete',
+          index: index + 1,
+          inferredLanguage,
+          modelCueCount: modelWindowCues.length,
+          accepted: assessment.accepted.length,
+          rejected: assessment.rejected.length,
+        });
+      }
+    }
+
+    const rejectedWindowCues = assessment.rejected;
+    rejectedHallucinations += rejectedWindowCues.length;
+    if (rejectedWindowCues.length) {
+      appendJobLog(plan.logPath, {
+        stage: 'recognize',
+        event: 'hallucination-filter',
+        index: index + 1,
+        rejected: rejectedWindowCues.length,
+        cues: rejectedWindowCues.map(({ cue, reason }) => ({
+          reason,
+          text: cue.original.slice(0, 160),
+        })),
+      });
+    }
+    const rawWindowCues = assessment.accepted
+      .map((cue, cueIndex) => ({
+        ...cue,
+        id: `node-whisper-${index + 1}-${cueIndex + 1}`,
+        start: cue.start + window.offsetSeconds,
+        end: cue.end + window.offsetSeconds,
+      }));
     // Each overlapping window owns only its central time region. The overlap
     // gives Whisper context across a 30-second boundary without emitting the
     // same spoken phrase twice.
@@ -501,14 +610,22 @@ async function recognizeAudio(plan) {
       event: 'window-complete',
       index: index + 1,
       total: windows.length,
+      modelCueCount: modelWindowCues.length,
+      rejectedHallucinations: rejectedWindowCues.length,
       rawCueCount: rawWindowCues.length,
       cueCount: windowCues.length,
     });
   }
   const stitchedCues = stitchWindowCues(cues, durationSeconds);
   const durationMs = Date.now() - startedAt;
-  appendJobLog(plan.logPath, { stage: 'recognize', event: 'complete', durationMs, cueCount: stitchedCues.length });
-  return { cues: stitchedCues, durationMs };
+  appendJobLog(plan.logPath, {
+    stage: 'recognize',
+    event: 'complete',
+    durationMs,
+    cueCount: stitchedCues.length,
+    rejectedHallucinations,
+  });
+  return { cues: stitchedCues, durationMs, rejectedHallucinations };
 }
 
 export async function runWhisperJob(jobSpec) {
@@ -524,21 +641,58 @@ export async function runWhisperJob(jobSpec) {
 
   const stages = [];
   try {
-    appendJobLog(plan.logPath, { event: 'job-start', jobId: plan.jobId, outputDir: plan.outputDir, model: plan.model.id });
+    appendJobLog(plan.logPath, {
+      event: 'job-start',
+      jobId: plan.jobId,
+      outputDir: plan.outputDir,
+      model: plan.model.id,
+      language: plan.language,
+    });
 
     const probe = await runCommand(plan.commands.probe, 'ffprobe', plan.logPath);
+    try {
+      const probeData = JSON.parse(probe.stdout);
+      appendJobLog(plan.logPath, {
+        stage: 'ffprobe',
+        event: 'media-summary',
+        formatDurationSeconds: Number(probeData?.format?.duration) || null,
+        audioStreams: (probeData?.streams || [])
+          .filter((stream) => stream.codec_type === 'audio')
+          .map((stream) => ({
+            index: stream.index,
+            codec: stream.codec_name,
+            durationSeconds: Number(stream.duration) || null,
+            sampleRate: Number(stream.sample_rate) || null,
+            channels: stream.channels || null,
+            language: stream.tags?.language || null,
+            default: Boolean(stream.disposition?.default),
+          })),
+      });
+    } catch (error) {
+      appendJobLog(plan.logPath, {
+        stage: 'ffprobe',
+        event: 'summary-unavailable',
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
     stages.push({ id: 'ffprobe', label: 'Probe media', durationMs: probe.durationMs });
 
     const audio = await runCommand(plan.commands.extractAudio, 'ffmpeg', plan.logPath);
     stages.push({ id: 'ffmpeg', label: 'Extract mono 16 kHz audio', durationMs: audio.durationMs });
 
     const recognized = await recognizeAudio(plan);
-    stages.push({ id: 'recognize', label: 'Recognize speech with local Whisper', durationMs: recognized.durationMs });
+    stages.push({
+      id: 'recognize',
+      label: 'Recognize speech with local Whisper',
+      durationMs: recognized.durationMs,
+      rejectedHallucinations: recognized.rejectedHallucinations,
+    });
     stages.push({ id: 'cues', label: 'Parse timestamped cues', durationMs: 0, count: recognized.cues.length });
     appendJobLog(plan.logPath, { event: 'job-complete', cueCount: recognized.cues.length });
     return {
       cues: recognized.cues,
       detectedLanguage: plan.language === 'auto' ? null : plan.language,
+      rejectedHallucinations: recognized.rejectedHallucinations,
       plan,
       stages,
     };
