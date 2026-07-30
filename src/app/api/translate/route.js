@@ -35,12 +35,32 @@ export async function POST(request) {
             resultText = await geminiRefine(text, resultText, from, to, llmModel, apiKey);
         }
 
+        const unchanged = resultText.trim() === text.trim();
+        if (unchanged) {
+            console.warn('[Translate API] Warning: translated text is identical to the original', {
+                from,
+                to,
+                original: text,
+                translated: resultText,
+            });
+        } else {
+            console.log('[Translate API] Success', {
+                from,
+                to,
+                original: text,
+                translated: resultText,
+            });
+        }
+
         return new Response(JSON.stringify({ text: resultText }), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
         });
     } catch (error) {
-        console.error("[API] Translation Route Error:", error);
-        return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+        const message = error instanceof Error ? error.message : String(error);
+        console.error("[Translate API] Failed", {
+            message,
+        });
+        return new Response(JSON.stringify({ error: message }), { status: 500 });
     }
 }
