@@ -761,7 +761,7 @@ export default function Home() {
   const [panelTab, setPanelTab] = useState('queue');
   const [muted, setMuted] = useState(false);
   const [batchSize, setBatchSize] = useState(50);
-  const [concurrency, setConcurrency] = useState(6);
+  const [concurrency, setConcurrency] = useState(3);
   const [cacheEnabled, setCacheEnabled] = useState(true);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackTime, setPlaybackTime] = useState(0);
@@ -1384,7 +1384,19 @@ export default function Home() {
       );
 
       // --- Stage 1: transcription -------------------------------------------
-      const { cues: asrCues, detectedLanguage, engine, status, logPath, job } = await transcribeVideo(file, {
+      const {
+        cues: asrCues,
+        detectedLanguage,
+        effectiveQuality,
+        autoUpgraded,
+        languageDetection,
+        recoveredCueCount,
+        attemptedGapRecoveries,
+        engine,
+        status,
+        logPath,
+        job,
+      } = await transcribeVideo(file, {
         engine: 'node-whisper',
         language: jobSourceLang,
         quality: jobQuality,
@@ -1418,18 +1430,42 @@ export default function Home() {
       }
 
       const detected = detectedLanguage || null;
-      if (jobSourceLang === 'detect' && detected) setDetectedLang(detected);
+      if (jobSourceLang === 'detect' && detected) {
+        setDetectedLang(detected);
+        setSourceLang(detected);
+      }
+      if (autoUpgraded && effectiveQuality === 'best') {
+        setQuality('best');
+        setCleanup(qualityPresets.best.cleanup);
+      }
       if (status) setTranscriptionStatus(status);
       setTranscriptionDebug({
         engine,
         job,
         logPath,
         status,
-        languages: { source: jobSourceLang, target: jobTargetLang },
+        languages: { source: jobSourceLang, detected, target: jobTargetLang },
+        smartAuto: {
+          effectiveQuality,
+          autoUpgraded,
+          confidence: languageDetection?.confidence || 0,
+          evidence: languageDetection?.evidence || null,
+        },
+        gapRecovery: { attempted: attemptedGapRecoveries, recovered: recoveredCueCount },
       });
       updateTranscriptionTrace('transfer', 'done', 'The actual media input reached the selected engine.');
-      updateTranscriptionTrace('native', 'done', 'ffprobe, FFmpeg, and local Whisper completed.');
-      updateTranscriptionTrace('cues', 'done', `${asrCues.length} timestamped source cues were created.`);
+      updateTranscriptionTrace(
+        'native',
+        'done',
+        autoUpgraded
+          ? `${sourceLangLabel(detected)} detected; restarted from 0:00 with Whisper Small (Best).`
+          : 'ffprobe, FFmpeg, and local Whisper completed.',
+      );
+      updateTranscriptionTrace(
+        'cues',
+        'done',
+        `${asrCues.length} timestamped source cues were created; recovered ${recoveredCueCount || 0} cue${recoveredCueCount === 1 ? '' : 's'} from uncovered speech regions.`,
+      );
 
       // --- Stage 2: translation ---------------------------------------------
       setProcessingStage(`Translating to ${languageLabel(jobTargetLang)}`);
@@ -1490,11 +1526,16 @@ export default function Home() {
       setProcessingProgress(1);
       setProcessingStage(translationsReady ? 'Done' : 'Translation failed');
 
-      const detectNote = jobSourceLang === 'detect' && detected ? ` Detected ${sourceLangLabel(detected)}.` : '';
+      const detectNote = jobSourceLang === 'detect' && detected
+        ? ` Detected ${sourceLangLabel(detected)}${autoUpgraded ? ' and switched to Best before restarting from the beginning' : ''}.`
+        : '';
+      const recoveryNote = recoveredCueCount
+        ? ` Recovered ${recoveredCueCount} cue${recoveredCueCount === 1 ? '' : 's'} from subtitle gaps.`
+        : '';
       const engineNote = ` with ${engine}`;
       const logNote = logPath ? ` Log: ${logPath}.` : '';
       setStatusMessage(translationsReady
-        ? `Transcribed ${finalCues.length} cues${engineNote} and translated to ${languageLabel(jobTargetLang)}.${detectNote}${logNote}`
+        ? `Transcribed ${finalCues.length} cues${engineNote} and translated to ${languageLabel(jobTargetLang)}.${detectNote}${recoveryNote}${logNote}`
         : `Transcription completed, but ${failedTranslations} translation${failedTranslations === 1 ? '' : 's'} failed after two attempts. Use Re-translate to try again.${logNote}`);
 
       // Move the viewer into the player once dual subs are ready. The video
@@ -1796,6 +1837,7 @@ export default function Home() {
         original: cue.original,
       };
       let lastFailure = 'Translation failed for an unknown reason.';
+      let retryAfterMs = 0;
 
       for (let attempt = 1; attempt <= TRANSLATION_MAX_ATTEMPTS; attempt += 1) {
         const controller = new AbortController();
@@ -1852,6 +1894,15 @@ export default function Home() {
           }
 
           const errorBody = await response.text().catch(() => '');
+          let errorData = null;
+          try {
+            errorData = JSON.parse(errorBody);
+          } catch {
+            // Keep the raw response for diagnostics.
+          }
+          retryAfterMs = response.status === 429
+            ? Math.max(1000, Number(errorData?.retryAfterMs) || Number(response.headers.get('Retry-After')) * 1000 || 8000)
+            : 0;
           lastFailure = `Translation API returned HTTP ${response.status}${errorBody ? `: ${errorBody}` : ''}`;
           console.error('[Translation] Failed: API returned an error', {
             ...translationContext,
@@ -1879,7 +1930,11 @@ export default function Home() {
             ...translationContext,
             nextAttempt: attempt + 1,
             reason: lastFailure,
+            retryAfterMs,
           });
+          if (retryAfterMs) {
+            await new Promise((resolve) => window.setTimeout(resolve, retryAfterMs));
+          }
         }
       }
 
