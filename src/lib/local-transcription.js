@@ -12,6 +12,14 @@ const WINDOW_SECONDS = 30;
 const WINDOW_OVERLAP_SECONDS = 5;
 const MIN_CUE_SECONDS = 0.25;
 const MAX_NEW_TOKENS = 128;
+const DETECTION_SAMPLE_SECONDS = 20;
+const MAX_DETECTION_SAMPLES = 3;
+const MIN_LANGUAGE_EVIDENCE = 3;
+const MIN_GAP_SECONDS = 1.2;
+const GAP_CONTEXT_SECONDS = 0.75;
+const MAX_GAP_RECOVERY_SECONDS = 28;
+const MAX_GAP_RECOVERY_ATTEMPTS = 16;
+const MODEL_LOAD_MAX_ATTEMPTS = 2;
 
 const QUALITY_MODELS = {
   fast: { id: 'Xenova/whisper-tiny', label: 'Tiny' },
@@ -188,6 +196,7 @@ export function buildWhisperJobPlan({ mediaPath, language = 'auto', quality = 'f
     wavPath,
     status,
     model,
+    quality,
     language: lang,
     commands: {
       probe: {
@@ -297,7 +306,10 @@ function createModelProgressLogger(logPath, modelId) {
   return (event) => {
     const progress = Number(event?.progress);
     const percent = Number.isFinite(progress) ? Math.floor(progress) : null;
-    if (event?.status === 'progress' && percent !== null && percent < lastPercent + 10 && percent !== 100) return;
+    if (event?.status === 'progress' && percent !== null) {
+      if (percent === 100 && lastPercent === 100) return;
+      if (percent !== 100 && percent < lastPercent + 10) return;
+    }
     if (percent !== null) lastPercent = percent;
     appendJobLog(logPath, {
       stage: 'model',
@@ -314,10 +326,28 @@ async function getRecognizer(model, modelCacheDir, logPath) {
   const existing = recognizerPromises.get(model.id);
   if (existing) return existing;
 
-  const pending = pipeline('automatic-speech-recognition', model.id, {
-    quantized: true,
-    progress_callback: createModelProgressLogger(logPath, model.id),
-  });
+  const pending = (async () => {
+    let lastError = null;
+    for (let attempt = 1; attempt <= MODEL_LOAD_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        return await pipeline('automatic-speech-recognition', model.id, {
+          quantized: true,
+          progress_callback: createModelProgressLogger(logPath, model.id),
+        });
+      } catch (error) {
+        lastError = error;
+        appendJobLog(logPath, {
+          stage: 'model',
+          event: attempt < MODEL_LOAD_MAX_ATTEMPTS ? 'load-retry' : 'load-failed',
+          model: model.id,
+          attempt,
+          maxAttempts: MODEL_LOAD_MAX_ATTEMPTS,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    throw lastError;
+  })();
   recognizerPromises.set(model.id, pending);
   try {
     return await pending;
@@ -410,12 +440,67 @@ export function whisperHallucinationReason(text) {
   return null;
 }
 
+function scriptLanguageEvidence(cues) {
+  const text = cues.map((cue) => cue.original).join(' ').normalize('NFKC');
+  const count = (pattern) => Array.from(text.matchAll(pattern)).length;
+  const kana = count(/[\p{Script=Hiragana}\p{Script=Katakana}]/gu);
+  const hangul = count(/\p{Script=Hangul}/gu);
+  const han = count(/\p{Script=Han}/gu);
+  const latin = count(/\p{Script=Latin}/gu);
+  const relevant = kana + hangul + han + latin;
+
+  let language = null;
+  let evidence = 0;
+  // Even a short, valid kana fragment is decisive: Chinese does not use kana.
+  // This prevents noisy auto-mode Han output from outvoting a real Japanese
+  // phrase such as the logged "よし" sample.
+  if (kana >= 2) {
+    language = 'ja';
+    evidence = kana + han;
+  } else if (hangul >= 2) {
+    language = 'ko';
+    evidence = hangul;
+  } else if (kana === 0 && hangul === 0 && han >= MIN_LANGUAGE_EVIDENCE) {
+    language = 'zh';
+    evidence = han;
+  }
+
+  // Script alone cannot distinguish supported Latin languages. A conservative
+  // stop-word vote works well on the combined 60-second sample and deliberately
+  // returns null when the winner is weak or ambiguous.
+  let latinVote = null;
+  if (!language && latin >= 12) {
+    const words = text.toLocaleLowerCase().match(/\p{Script=Latin}+/gu) || [];
+    const dictionaries = {
+      en: new Set(['the', 'and', 'you', 'your', 'to', 'is', 'are', 'of', 'in', 'that', 'this', 'it', 'for', 'with', 'was', 'have', 'not']),
+      es: new Set(['el', 'la', 'los', 'las', 'que', 'una', 'es', 'por', 'para', 'con', 'como', 'pero', 'del', 'esta', 'este']),
+      fr: new Set(['le', 'la', 'les', 'des', 'que', 'une', 'est', 'pour', 'avec', 'dans', 'pas', 'mais', 'vous', 'nous', 'sur']),
+      de: new Set(['der', 'die', 'das', 'den', 'dem', 'und', 'ist', 'ein', 'eine', 'mit', 'nicht', 'für', 'auf', 'ich', 'wir']),
+    };
+    const scores = Object.entries(dictionaries)
+      .map(([candidate, dictionary]) => ({
+        language: candidate,
+        score: words.reduce((total, word) => total + (dictionary.has(word) ? 1 : 0), 0),
+      }))
+      .sort((left, right) => right.score - left.score);
+    if (scores[0].score >= 4 && scores[0].score >= scores[1].score + 2) {
+      language = scores[0].language;
+      evidence = scores[0].score;
+      latinVote = { scores, wordCount: words.length };
+    }
+  }
+
+  return {
+    language,
+    confidence: language
+      ? Math.min(0.99, 0.7 + (evidence / Math.max(12, language && latinVote ? latinVote.wordCount : relevant)) * 0.29)
+      : 0,
+    evidence: { kana, hangul, han, latin, total: relevant, latinVote },
+  };
+}
+
 function inferLanguageFromScript(cues) {
-  const text = cues.map((cue) => cue.original).join(' ');
-  if (/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(text)) return 'ja';
-  if (/\p{Script=Hangul}/u.test(text)) return 'ko';
-  if (/[\p{Script=Han}]/u.test(text)) return 'zh';
-  return null;
+  return scriptLanguageEvidence(cues).language;
 }
 
 function assessWhisperCues(cues) {
@@ -496,31 +581,35 @@ function stitchWindowCues(cues, durationSeconds) {
   return stitched;
 }
 
-async function recognizeAudio(plan) {
-  const samples = readPcm16MonoWav(plan.wavPath);
-  const durationSeconds = samples.length / SAMPLE_RATE;
-  const recognizer = await getRecognizer(plan.model, lingoloopPaths().modelCacheDir, plan.logPath);
-  const windows = audioWindows(samples);
-  appendJobLog(plan.logPath, {
-    stage: 'recognize',
-    event: 'start',
-    model: plan.model.id,
-    language: plan.language,
-    durationSeconds,
-    windows: windows.length,
-  });
-  const startedAt = Date.now();
+function recognitionOptions(language) {
   const options = {
     return_timestamps: true,
     max_new_tokens: MAX_NEW_TOKENS,
-    // Prevent Whisper from filling a low-information window with the same
-    // token indefinitely (for example, "チチチ…"). The post-generation
-    // hallucination filter remains the final safety net.
     no_repeat_ngram_size: 5,
     repetition_penalty: 1.1,
     task: 'transcribe',
   };
-  if (plan.language !== 'auto') options.language = plan.language;
+  if (language !== 'auto') options.language = language;
+  return options;
+}
+
+async function recognizeSamples(plan, samples, { model, language, logStage = 'recognize' }) {
+  const durationSeconds = samples.length / SAMPLE_RATE;
+  const recognizer = await getRecognizer(model, lingoloopPaths().modelCacheDir, plan.logPath);
+  const windows = audioWindows(samples);
+  appendJobLog(plan.logPath, {
+    stage: logStage,
+    event: 'start',
+    model: model.id,
+    language,
+    durationSeconds,
+    windows: windows.length,
+  });
+  const startedAt = Date.now();
+  // Prevent Whisper from filling a low-information window with the same token
+  // indefinitely. The post-generation hallucination filter remains the final
+  // safety net.
+  const options = recognitionOptions(language);
   const cues = [];
   let rejectedHallucinations = 0;
   for (let index = 0; index < windows.length; index += 1) {
@@ -532,7 +621,7 @@ async function recognizeAudio(plan) {
       ? durationSeconds
       : window.offsetSeconds + WINDOW_SECONDS - (WINDOW_OVERLAP_SECONDS / 2);
     appendJobLog(plan.logPath, {
-      stage: 'recognize',
+      stage: logStage,
       event: 'window-start',
       index: index + 1,
       total: windows.length,
@@ -550,11 +639,11 @@ async function recognizeAudio(plan) {
     // Transformers.js does not expose a reliable detected-language result.
     // If auto mode produces only obvious garbage but its script gives us a
     // strong hint, retry this window once with that language forced.
-    if (plan.language === 'auto' && assessment.accepted.length === 0 && assessment.rejected.length > 0) {
+    if (language === 'auto' && assessment.accepted.length === 0 && assessment.rejected.length > 0) {
       const inferredLanguage = inferLanguageFromScript(modelWindowCues);
       if (inferredLanguage) {
         appendJobLog(plan.logPath, {
-          stage: 'recognize',
+          stage: logStage,
           event: 'auto-language-retry',
           index: index + 1,
           inferredLanguage,
@@ -564,7 +653,7 @@ async function recognizeAudio(plan) {
         modelWindowCues = transformerOutputToCues(output, windowDuration);
         assessment = assessWhisperCues(modelWindowCues);
         appendJobLog(plan.logPath, {
-          stage: 'recognize',
+          stage: logStage,
           event: 'auto-language-retry-complete',
           index: index + 1,
           inferredLanguage,
@@ -579,7 +668,7 @@ async function recognizeAudio(plan) {
     rejectedHallucinations += rejectedWindowCues.length;
     if (rejectedWindowCues.length) {
       appendJobLog(plan.logPath, {
-        stage: 'recognize',
+        stage: logStage,
         event: 'hallucination-filter',
         index: index + 1,
         rejected: rejectedWindowCues.length,
@@ -606,7 +695,7 @@ async function recognizeAudio(plan) {
     });
     cues.push(...windowCues);
     appendJobLog(plan.logPath, {
-      stage: 'recognize',
+      stage: logStage,
       event: 'window-complete',
       index: index + 1,
       total: windows.length,
@@ -619,13 +708,197 @@ async function recognizeAudio(plan) {
   const stitchedCues = stitchWindowCues(cues, durationSeconds);
   const durationMs = Date.now() - startedAt;
   appendJobLog(plan.logPath, {
-    stage: 'recognize',
+    stage: logStage,
     event: 'complete',
     durationMs,
     cueCount: stitchedCues.length,
     rejectedHallucinations,
   });
   return { cues: stitchedCues, durationMs, rejectedHallucinations };
+}
+
+function representativeSampleRanges(durationSeconds) {
+  if (durationSeconds <= DETECTION_SAMPLE_SECONDS) {
+    return [{ start: 0, end: durationSeconds }];
+  }
+  const maxStart = Math.max(0, durationSeconds - DETECTION_SAMPLE_SECONDS);
+  const starts = [
+    Math.min(maxStart, Math.max(0, durationSeconds * 0.08)),
+    Math.min(maxStart, Math.max(0, (durationSeconds - DETECTION_SAMPLE_SECONDS) / 2)),
+    Math.min(maxStart, Math.max(0, durationSeconds * 0.82 - DETECTION_SAMPLE_SECONDS / 2)),
+  ];
+  return [...new Set(starts.map((value) => Number(value.toFixed(3))))]
+    .slice(0, MAX_DETECTION_SAMPLES)
+    .map((start) => ({ start, end: Math.min(durationSeconds, start + DETECTION_SAMPLE_SECONDS) }));
+}
+
+async function detectSpokenLanguage(plan, samples) {
+  const durationSeconds = samples.length / SAMPLE_RATE;
+  const recognizer = await getRecognizer(plan.model, lingoloopPaths().modelCacheDir, plan.logPath);
+  const ranges = representativeSampleRanges(durationSeconds);
+  const languageEvidenceCues = [];
+  appendJobLog(plan.logPath, {
+    stage: 'language-detection',
+    event: 'start',
+    model: plan.model.id,
+    ranges,
+  });
+
+  for (let index = 0; index < ranges.length; index += 1) {
+    const range = ranges[index];
+    const startSample = Math.floor(range.start * SAMPLE_RATE);
+    const endSample = Math.min(samples.length, Math.ceil(range.end * SAMPLE_RATE));
+    const sample = samples.subarray(startSample, endSample);
+    const output = await recognizer(sample, { ...recognitionOptions('auto') });
+    const modelCues = transformerOutputToCues(output, sample.length / SAMPLE_RATE);
+    const assessment = assessWhisperCues(modelCues);
+    languageEvidenceCues.push(...assessment.accepted);
+    // Repetitive garbage is unusable as subtitle text, but a short capped
+    // fragment such as "チチチ…" still provides a useful Japanese-script hint.
+    // Pure sound markers remain excluded so repeated "(笑)" samples cannot be
+    // mistaken for Chinese.
+    languageEvidenceCues.push(...assessment.rejected
+      .filter(({ reason }) => reason !== 'the cue contains only a non-speech sound marker')
+      .map(({ cue }) => ({ ...cue, original: Array.from(cue.original).slice(0, 12).join('') })));
+    appendJobLog(plan.logPath, {
+      stage: 'language-detection',
+      event: 'sample-complete',
+      index: index + 1,
+      range,
+      accepted: assessment.accepted.length,
+      rejected: assessment.rejected.length,
+      preview: assessment.accepted.map((cue) => cue.original).join(' ').slice(0, 240),
+    });
+  }
+
+  const result = scriptLanguageEvidence(languageEvidenceCues);
+  appendJobLog(plan.logPath, {
+    stage: 'language-detection',
+    event: 'complete',
+    ...result,
+  });
+  return result;
+}
+
+function percentile(values, fraction) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * fraction)))];
+}
+
+function frameEnergyProfile(samples) {
+  const frameSamples = Math.round(SAMPLE_RATE * 0.1);
+  const energies = [];
+  for (let offset = 0; offset < samples.length; offset += frameSamples) {
+    const end = Math.min(samples.length, offset + frameSamples);
+    let sumSquares = 0;
+    for (let index = offset; index < end; index += 1) sumSquares += samples[index] * samples[index];
+    energies.push(Math.sqrt(sumSquares / Math.max(1, end - offset)));
+  }
+  const noiseFloor = percentile(energies, 0.2);
+  const activeLevel = percentile(energies, 0.75);
+  const threshold = Math.max(0.004, noiseFloor * 2.5, activeLevel * 0.18);
+  return { energies, frameSeconds: frameSamples / SAMPLE_RATE, threshold };
+}
+
+function uncoveredRanges(cues, durationSeconds) {
+  const sorted = [...cues].sort((left, right) => left.start - right.start);
+  const ranges = [];
+  let cursor = 0;
+  for (const cue of sorted) {
+    if (cue.start - cursor >= MIN_GAP_SECONDS) ranges.push({ start: cursor, end: cue.start });
+    cursor = Math.max(cursor, cue.end);
+  }
+  if (durationSeconds - cursor >= MIN_GAP_SECONDS) ranges.push({ start: cursor, end: durationSeconds });
+  return ranges;
+}
+
+function speechGapCandidates(samples, cues) {
+  const durationSeconds = samples.length / SAMPLE_RATE;
+  const profile = frameEnergyProfile(samples);
+  const candidates = [];
+  for (const range of uncoveredRanges(cues, durationSeconds)) {
+    const firstFrame = Math.max(0, Math.floor(range.start / profile.frameSeconds));
+    const lastFrame = Math.min(profile.energies.length, Math.ceil(range.end / profile.frameSeconds));
+    const frames = profile.energies.slice(firstFrame, lastFrame);
+    const active = frames.map((value) => value >= profile.threshold);
+    const activeRatio = active.filter(Boolean).length / Math.max(1, active.length);
+    let longestRun = 0;
+    let currentRun = 0;
+    for (const isActive of active) {
+      currentRun = isActive ? currentRun + 1 : 0;
+      longestRun = Math.max(longestRun, currentRun);
+    }
+    if (activeRatio < 0.18 || longestRun * profile.frameSeconds < 0.3) continue;
+
+    for (let start = range.start; start < range.end; start += MAX_GAP_RECOVERY_SECONDS) {
+      candidates.push({
+        start,
+        end: Math.min(range.end, start + MAX_GAP_RECOVERY_SECONDS),
+        activeRatio: Number(activeRatio.toFixed(3)),
+      });
+      if (candidates.length >= MAX_GAP_RECOVERY_ATTEMPTS) return { candidates, threshold: profile.threshold };
+    }
+  }
+  return { candidates, threshold: profile.threshold };
+}
+
+async function recoverSpeechGaps(plan, samples, cues, { model, language }) {
+  const durationSeconds = samples.length / SAMPLE_RATE;
+  const { candidates, threshold } = speechGapCandidates(samples, cues);
+  appendJobLog(plan.logPath, {
+    stage: 'gap-recovery',
+    event: 'start',
+    threshold,
+    candidates,
+  });
+  if (!candidates.length) return { cues, recoveredCueCount: 0, attemptedGaps: 0, durationMs: 0 };
+
+  const startedAt = Date.now();
+  const recognizer = await getRecognizer(model, lingoloopPaths().modelCacheDir, plan.logPath);
+  const recovered = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    const gap = candidates[index];
+    const paddedStart = Math.max(0, gap.start - GAP_CONTEXT_SECONDS);
+    const paddedEnd = Math.min(durationSeconds, gap.end + GAP_CONTEXT_SECONDS);
+    const segment = samples.subarray(
+      Math.floor(paddedStart * SAMPLE_RATE),
+      Math.ceil(paddedEnd * SAMPLE_RATE),
+    );
+    const output = await recognizer(segment, { ...recognitionOptions(language) });
+    const assessment = assessWhisperCues(transformerOutputToCues(output, segment.length / SAMPLE_RATE));
+    const gapCues = assessment.accepted
+      .map((cue, cueIndex) => ({
+        ...cue,
+        id: `node-whisper-gap-${index + 1}-${cueIndex + 1}`,
+        start: cue.start + paddedStart,
+        end: cue.end + paddedStart,
+      }))
+      .filter((cue) => {
+        const midpoint = cue.start + ((cue.end - cue.start) / 2);
+        return midpoint >= gap.start && midpoint <= gap.end;
+      });
+    recovered.push(...gapCues);
+    appendJobLog(plan.logPath, {
+      stage: 'gap-recovery',
+      event: 'gap-complete',
+      index: index + 1,
+      gap,
+      recovered: gapCues.length,
+      rejected: assessment.rejected.length,
+    });
+  }
+  const merged = stitchWindowCues([...cues, ...recovered], durationSeconds);
+  const durationMs = Date.now() - startedAt;
+  appendJobLog(plan.logPath, {
+    stage: 'gap-recovery',
+    event: 'complete',
+    attemptedGaps: candidates.length,
+    recoveredCueCount: recovered.length,
+    finalCueCount: merged.length,
+    durationMs,
+  });
+  return { cues: merged, recoveredCueCount: recovered.length, attemptedGaps: candidates.length, durationMs };
 }
 
 export async function runWhisperJob(jobSpec) {
@@ -680,18 +953,78 @@ export async function runWhisperJob(jobSpec) {
     const audio = await runCommand(plan.commands.extractAudio, 'ffmpeg', plan.logPath);
     stages.push({ id: 'ffmpeg', label: 'Extract mono 16 kHz audio', durationMs: audio.durationMs });
 
-    const recognized = await recognizeAudio(plan);
+    const samples = readPcm16MonoWav(plan.wavPath);
+    let detectedLanguage = plan.language === 'auto' ? null : plan.language;
+    let languageDetection = null;
+    let effectiveQuality = plan.quality;
+    let effectiveModel = plan.model;
+    let autoUpgraded = false;
+
+    if (plan.language === 'auto') {
+      languageDetection = await detectSpokenLanguage(plan, samples);
+      detectedLanguage = languageDetection.language;
+      if (detectedLanguage) {
+        const bestStatus = getWhisperStatus('best');
+        if (!bestStatus.ready) {
+          throw stageFailure(
+            'preflight',
+            `Smart Auto detected ${detectedLanguage}, but the Best transcription model is unavailable.`,
+          );
+        }
+        effectiveQuality = 'best';
+        effectiveModel = modelForQuality('best');
+        autoUpgraded = plan.quality !== 'best';
+        appendJobLog(plan.logPath, {
+          stage: 'language-detection',
+          event: 'smart-auto-upgrade',
+          detectedLanguage,
+          fromQuality: plan.quality,
+          toQuality: effectiveQuality,
+          fromModel: plan.model.id,
+          toModel: effectiveModel.id,
+        });
+      }
+    }
+
+    const recognized = await recognizeSamples(plan, samples, {
+      model: effectiveModel,
+      language: detectedLanguage || plan.language,
+      logStage: detectedLanguage && plan.language === 'auto' ? 'recognize-smart-auto' : 'recognize',
+    });
+    const recovered = await recoverSpeechGaps(plan, samples, recognized.cues, {
+      model: effectiveModel,
+      language: detectedLanguage || plan.language,
+    });
     stages.push({
       id: 'recognize',
       label: 'Recognize speech with local Whisper',
       durationMs: recognized.durationMs,
       rejectedHallucinations: recognized.rejectedHallucinations,
     });
-    stages.push({ id: 'cues', label: 'Parse timestamped cues', durationMs: 0, count: recognized.cues.length });
-    appendJobLog(plan.logPath, { event: 'job-complete', cueCount: recognized.cues.length });
+    stages.push({
+      id: 'gap-recovery',
+      label: 'Recover speech regions without subtitles',
+      durationMs: recovered.durationMs,
+      attemptedGaps: recovered.attemptedGaps,
+      recoveredCueCount: recovered.recoveredCueCount,
+    });
+    stages.push({ id: 'cues', label: 'Parse timestamped cues', durationMs: 0, count: recovered.cues.length });
+    appendJobLog(plan.logPath, {
+      event: 'job-complete',
+      cueCount: recovered.cues.length,
+      detectedLanguage,
+      effectiveQuality,
+      autoUpgraded,
+      recoveredCueCount: recovered.recoveredCueCount,
+    });
     return {
-      cues: recognized.cues,
-      detectedLanguage: plan.language === 'auto' ? null : plan.language,
+      cues: recovered.cues,
+      detectedLanguage,
+      effectiveQuality,
+      autoUpgraded,
+      languageDetection,
+      recoveredCueCount: recovered.recoveredCueCount,
+      attemptedGapRecoveries: recovered.attemptedGaps,
       rejectedHallucinations: recognized.rejectedHallucinations,
       plan,
       stages,

@@ -76,9 +76,23 @@ async function transcribeWithLocalEngine(file, { language, quality, mediaPath, s
   }
   onProgress?.(0.85, 'Reading cues');
   const data = await res.json();
+  console.log('[Transcription] Completed', {
+    detectedLanguage: data.detectedLanguage || null,
+    effectiveQuality: data.effectiveQuality || quality,
+    autoUpgraded: Boolean(data.autoUpgraded),
+    languageConfidence: data.languageDetection?.confidence || 0,
+    recoveredCueCount: data.recoveredCueCount || 0,
+    attemptedGapRecoveries: data.attemptedGapRecoveries || 0,
+    cueCount: data.cues?.length || 0,
+  });
   return {
     cues: data.cues || [],
     detectedLanguage: data.detectedLanguage || null,
+    effectiveQuality: data.effectiveQuality || quality,
+    autoUpgraded: Boolean(data.autoUpgraded),
+    languageDetection: data.languageDetection || null,
+    recoveredCueCount: data.recoveredCueCount || 0,
+    attemptedGapRecoveries: data.attemptedGapRecoveries || 0,
     engine: 'node-whisper',
     logPath: data.logPath || null,
     status: data.status || null,

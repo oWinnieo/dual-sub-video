@@ -128,6 +128,11 @@ export async function POST(request) {
     const {
       cues,
       detectedLanguage,
+      effectiveQuality,
+      autoUpgraded,
+      languageDetection,
+      recoveredCueCount,
+      attemptedGapRecoveries,
       rejectedHallucinations,
       plan,
       stages,
@@ -152,6 +157,11 @@ export async function POST(request) {
     return NextResponse.json({
       cues,
       detectedLanguage,
+      effectiveQuality,
+      autoUpgraded,
+      languageDetection,
+      recoveredCueCount,
+      attemptedGapRecoveries,
       rejectedHallucinations,
       engine: 'node-whisper',
       status,
