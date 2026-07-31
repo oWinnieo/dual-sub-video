@@ -930,6 +930,85 @@ select:focus-visible {
   background: var(--accent-tint-weak);
 }
 
+.tooltip-control {
+  position: relative;
+}
+
+.tooltip-control:disabled {
+  opacity: 1;
+}
+
+.tooltip-control:disabled > svg {
+  opacity: 0.42;
+}
+
+.tooltip-control::before,
+.tooltip-control::after {
+  position: absolute;
+  left: 50%;
+  z-index: 30;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease, transform 120ms ease;
+}
+
+.tooltip-control::before {
+  content: '';
+  bottom: calc(100% + 5px);
+  border: 5px solid transparent;
+  border-top-color: rgba(7, 6, 4, 0.96);
+  transform: translate(-50%, 3px);
+}
+
+.tooltip-control::after {
+  content: attr(data-tooltip);
+  bottom: calc(100% + 15px);
+  width: max-content;
+  max-width: min(340px, calc(100vw - 32px));
+  padding: 7px 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  background: rgba(7, 6, 4, 0.96);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.36);
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.25;
+  text-align: center;
+  white-space: normal;
+  transform: translate(-50%, 3px);
+}
+
+.tooltip-control:hover::before,
+.tooltip-control:hover::after,
+.tooltip-control:focus-visible::before,
+.tooltip-control:focus-visible::after {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+.transport > .tooltip-control:last-child::before,
+.transport > .tooltip-control:last-child::after {
+  right: 0;
+  left: auto;
+}
+
+.transport > .tooltip-control:last-child::before {
+  right: 13px;
+  transform: translateY(3px);
+}
+
+.transport > .tooltip-control:last-child::after {
+  transform: translateY(3px);
+}
+
+.transport > .tooltip-control:last-child:hover::before,
+.transport > .tooltip-control:last-child:hover::after,
+.transport > .tooltip-control:last-child:focus-visible::before,
+.transport > .tooltip-control:last-child:focus-visible::after {
+  transform: translateY(0);
+}
+
 .video-frame {
   position: relative;
   min-height: 360px;
@@ -2689,6 +2768,13 @@ select:focus-visible {
   scrollbar-width: thin;
 }
 
+.library-item-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: stretch;
+}
+
 .library-item {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
@@ -2713,6 +2799,24 @@ select:focus-visible {
 .library-item.active {
   border-color: var(--accent-border);
   background: var(--accent-tint-weak);
+}
+
+.library-delete-button {
+  width: 40px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--muted);
+  background: var(--tint-1);
+  cursor: pointer;
+  transition: border-color 160ms ease, background 160ms ease, color 160ms ease;
+}
+
+.library-delete-button:hover:not(:disabled) {
+  border-color: rgba(224, 133, 115, 0.58);
+  color: var(--red);
+  background: rgba(224, 133, 115, 0.1);
 }
 
 .library-item svg {
