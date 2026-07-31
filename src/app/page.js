@@ -28,6 +28,7 @@ import {
   Settings,
   SlidersHorizontal,
   Sparkles,
+  Trash2,
   Upload,
   Volume2,
   VolumeX,
@@ -639,9 +640,17 @@ function parseBatchManifest(name, text) {
     .map((line, index) => makeQueueItem(line, index));
 }
 
-function IconButton({ label, icon: Icon, active, disabled = false, onClick }) {
+function IconButton({ label, icon: Icon, active, disabled = false, onClick, tooltip = false }) {
   return (
-    <button type="button" className={`icon-button${active ? ' active' : ''}`} aria-label={label} title={label} disabled={disabled} onClick={onClick}>
+    <button
+      type="button"
+      className={`icon-button${active ? ' active' : ''}${tooltip ? ' tooltip-control' : ''}`}
+      aria-label={label}
+      title={tooltip ? undefined : label}
+      data-tooltip={tooltip ? label : undefined}
+      disabled={disabled}
+      onClick={onClick}
+    >
       <Icon size={18} strokeWidth={2} />
     </button>
   );
@@ -1113,6 +1122,60 @@ export default function Home() {
 
   const updateLibraryItem = (id, patch) => {
     setLibrary((current) => current.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+  };
+
+  const removeLibraryItem = (item) => {
+    if (!item) return;
+    if (processing || batchRunning || item.status === 'processing') {
+      setStatusMessage('Wait for subtitle processing to finish before removing videos from the library.');
+      return;
+    }
+    if (!window.confirm(`Remove "${item.name}" from Your library?\n\nThe original file on your computer will not be deleted.`)) return;
+
+    const current = libraryRef.current;
+    const removedIndex = current.findIndex((entry) => entry.id === item.id);
+    if (removedIndex < 0) return;
+    const remaining = current.filter((entry) => entry.id !== item.id);
+    libraryRef.current = remaining;
+    setLibrary(remaining);
+
+    if (activeItemIdRef.current === item.id) {
+      videoRef.current?.pause();
+      if (simulationRef.current) {
+        window.clearInterval(simulationRef.current);
+        simulationRef.current = null;
+      }
+      activeItemIdRef.current = null;
+      setActiveItemId(null);
+      mediaFileRef.current = null;
+      setMediaUrl('');
+      setMediaPath('');
+      setIsPlaying(false);
+      setDuration(0);
+      setPlaybackTime(0);
+      setCues([]);
+      setSelectedWord(null);
+      setSubtitleOrigin('unprocessed');
+      setTranslationDone(false);
+      setDetectedLang(null);
+      clearSubtitleLog();
+
+      const nextItem = remaining[Math.min(removedIndex, remaining.length - 1)];
+      if (nextItem) {
+        selectLibraryItem(nextItem);
+      } else {
+        setMediaName('No video selected');
+        setSidecarName('');
+        setTranscriptionTrace([]);
+        setTranscriptionDebug(null);
+        setViewStep('landing');
+      }
+    }
+
+    if (item.url) {
+      window.setTimeout(() => URL.revokeObjectURL(item.url), 0);
+    }
+    setStatusMessage(`Removed ${item.name} from Your library. The original file was not deleted.`);
   };
 
   // Make a library item the one showing in the player. Processed items open
@@ -2407,16 +2470,24 @@ export default function Home() {
                 <span className="seek-handle" style={{ left: `${mediaDuration ? Math.min(100, (playbackTime / mediaDuration) * 100) : 0}%` }} aria-hidden="true" />
               </div>
               <span className="timecode">{clockShort(playbackTime)} / {clockShort(mediaDuration)}</span>
-              <button type="button" className="icon-button rate-button" title="Playback speed" onClick={cyclePlaybackRate}>{playbackRate}×</button>
-              <IconButton label="Replay this line" icon={Repeat} onClick={loopCurrentCue} />
+              <button
+                type="button"
+                className="icon-button rate-button tooltip-control"
+                aria-label={`Playback speed: ${playbackRate}×. Click to change.`}
+                data-tooltip={`Playback speed: ${playbackRate}× · click to change`}
+                onClick={cyclePlaybackRate}
+              >
+                {playbackRate}×
+              </button>
+              <IconButton tooltip label="Replay the current subtitle line" icon={Repeat} onClick={loopCurrentCue} />
               {mode === 'education' ? (
                 <>
-                  <IconButton label="Practice speaking this line (shadow)" icon={AudioWaveform} onClick={shadowCurrentCue} />
-                  <IconButton label={`Save this line as a flashcard${dueCards ? ` (${dueCards} due)` : ''}`} icon={BookOpen} onClick={mineCurrentCue} />
+                  <IconButton tooltip disabled label="Practice speaking this line (shadowing) · Coming Soon" icon={AudioWaveform} onClick={shadowCurrentCue} />
+                  <IconButton tooltip disabled label="Save this line as a flashcard · Coming Soon" icon={BookOpen} onClick={mineCurrentCue} />
                 </>
               ) : null}
-              <IconButton label={muted ? 'Unmute (M)' : 'Mute (M)'} icon={muted ? VolumeX : Volume2} active={muted} onClick={toggleMute} />
-              <IconButton label="Fullscreen (F)" icon={Maximize2} onClick={toggleFullscreen} />
+              <IconButton tooltip label={muted ? 'Unmute audio (M)' : 'Mute audio (M)'} icon={muted ? VolumeX : Volume2} active={muted} onClick={toggleMute} />
+              <IconButton tooltip label="Enter or exit fullscreen (F)" icon={Maximize2} onClick={toggleFullscreen} />
             </div>
           </div>
 
@@ -2613,26 +2684,40 @@ export default function Home() {
               </button>
             </div>
             <div className="library-list">
-              {library.length ? library.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  className={`library-item ${item.status}${item.id === activeItemId ? ' active' : ''}`}
-                  onClick={() => { selectLibraryItem(item); setLibraryOpen(false); }}
-                >
-                  <Film size={16} />
-                  <span className="library-item-name">{item.name}</span>
-                  <small>
-                    {item.status === 'processing' ? `${item.progress}% · ${item.stage}`
-                      : item.status === 'done' ? 'Subtitles ready — click to watch'
-                        : item.status === 'failed' ? `Failed: ${item.error}`
-                          : 'Waiting — no subtitles yet'}
-                  </small>
-                  {item.status === 'processing' ? (
-                    <span className="mini-progress"><span style={{ width: `${item.progress}%` }} /></span>
-                  ) : null}
-                </button>
-              )) : (
+              {library.length ? library.map((item) => {
+                const deleteDisabled = processing || batchRunning || item.status === 'processing';
+                return (
+                  <article key={item.id} className={`library-item-row${item.id === activeItemId ? ' active' : ''}`}>
+                    <button
+                      type="button"
+                      className={`library-item ${item.status}${item.id === activeItemId ? ' active' : ''}`}
+                      onClick={() => { selectLibraryItem(item); setLibraryOpen(false); }}
+                    >
+                      <Film size={16} />
+                      <span className="library-item-name">{item.name}</span>
+                      <small>
+                        {item.status === 'processing' ? `${item.progress}% · ${item.stage}`
+                          : item.status === 'done' ? 'Subtitles ready — click to watch'
+                            : item.status === 'failed' ? `Failed: ${item.error}`
+                              : 'Waiting — no subtitles yet'}
+                      </small>
+                      {item.status === 'processing' ? (
+                        <span className="mini-progress"><span style={{ width: `${item.progress}%` }} /></span>
+                      ) : null}
+                    </button>
+                    <button
+                      type="button"
+                      className="library-delete-button"
+                      aria-label={`Remove ${item.name} from library`}
+                      title={deleteDisabled ? 'Available after subtitle processing finishes' : `Remove ${item.name} from library`}
+                      disabled={deleteDisabled}
+                      onClick={() => removeLibraryItem(item)}
+                    >
+                      <Trash2 size={17} />
+                    </button>
+                  </article>
+                );
+              }) : (
                 <p className="library-empty">Nothing here yet. Use &quot;Add videos&quot; above, or drop files anywhere on the start screen.</p>
               )}
             </div>
