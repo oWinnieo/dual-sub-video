@@ -4,9 +4,12 @@ import { geminiTranslate, geminiRefine } from '@/lib/gemini';
 const GOOGLE_MIN_INTERVAL_MS = 250;
 const GOOGLE_MAX_ATTEMPTS = 3;
 const GOOGLE_RETRY_DELAYS_MS = [0, 1200, 4000];
+const TRANSLATION_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const TRANSLATION_CACHE_MAX_ENTRIES = 5000;
 let googleQueue = Promise.resolve();
 let lastGoogleRequestAt = 0;
 let googlePrimaryLimitedUntil = 0;
+const translationCache = new Map();
 
 function wait(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -17,6 +20,32 @@ function translationErrorStatus(error) {
     if (Number.isFinite(explicit) && explicit >= 400) return explicit;
     const match = String(error?.message || '').match(/status(?: code)?\s+(\d{3})/i);
     return match ? Number(match[1]) : 500;
+}
+
+function translationCacheKey(text, from, to) {
+    return `${from}\u0000${to}\u0000${text}`;
+}
+
+function readTranslationCache(key) {
+    const cached = translationCache.get(key);
+    if (!cached) return null;
+    if (Date.now() - cached.createdAt > TRANSLATION_CACHE_TTL_MS) {
+        translationCache.delete(key);
+        return null;
+    }
+    return cached.text;
+}
+
+function writeTranslationCache(key, text) {
+    if (translationCache.size >= TRANSLATION_CACHE_MAX_ENTRIES) {
+        const oldestKey = translationCache.keys().next().value;
+        if (oldestKey) translationCache.delete(oldestKey);
+    }
+    translationCache.set(key, { text, createdAt: Date.now() });
+}
+
+function isRetryableGoogleStatus(status) {
+    return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
 function enqueueGoogleTranslation(task) {
@@ -61,9 +90,11 @@ async function translateWithRateLimit(text, from, to) {
                     try {
                         return await translate(text, { from, to });
                     } catch (error) {
-                        if (translationErrorStatus(error) !== 429) throw error;
+                        const primaryStatus = translationErrorStatus(error);
                         googlePrimaryLimitedUntil = Date.now() + 60_000;
-                        console.warn('[Translate API] Primary Google channel is rate-limited; using GET fallback for 60 seconds.');
+                        console.warn('[Translate API] Primary Google channel failed; using GET fallback for 60 seconds.', {
+                            status: primaryStatus,
+                        });
                     }
                 }
                 return await translateWithGoogleGet(text, from, to);
@@ -75,7 +106,7 @@ async function translateWithRateLimit(text, from, to) {
                     attempt,
                     maxAttempts: GOOGLE_MAX_ATTEMPTS,
                 });
-                if (status !== 429 || attempt === GOOGLE_MAX_ATTEMPTS) break;
+                if (!isRetryableGoogleStatus(status) || attempt === GOOGLE_MAX_ATTEMPTS) break;
             }
         }
         const status = translationErrorStatus(lastError);
@@ -92,6 +123,7 @@ export async function POST(request) {
         const body = await request.json();
         const { text, from, llmModel, apiKey } = body;
         const to = typeof body.to === 'string' && body.to ? body.to : 'en';
+        const useCache = body.useCache !== false;
 
         if (!text) {
             return new Response(JSON.stringify({ error: "Text is required" }), { status: 400 });
@@ -104,12 +136,24 @@ export async function POST(request) {
             });
         }
 
+        const cacheKey = translationCacheKey(text, from, to);
+        const cachedText = useCache ? readTranslationCache(cacheKey) : null;
+        if (cachedText) {
+            return new Response(JSON.stringify({ text: cachedText, cached: true }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+            });
+        }
+
         let resultText = '';
 
-        // Use Gemini for Chinese translation if it fails or if specifically requested
-        if (to === 'zh' || to.startsWith('zh-')) {
+        // Only call Gemini when a real model was explicitly selected. The
+        // client sends "none" for the default translator, which must not be
+        // interpreted as a Gemini model id.
+        const useGemini = Boolean(llmModel && llmModel !== 'none' && (apiKey || process.env.GEMINI_API_KEY));
+        if (useGemini) {
             console.log("[API] Using Gemini for Chinese translation...");
-            resultText = await geminiTranslate(text, from, to, llmModel || 'gemini-1.5-flash', apiKey);
+            resultText = await geminiTranslate(text, from, to, llmModel, apiKey);
         }
 
         // If not Chinese or if Gemini failed, use the default translator
@@ -145,6 +189,9 @@ export async function POST(request) {
             });
         }
 
+
+        if (useCache) writeTranslationCache(cacheKey, resultText);
+
         return new Response(JSON.stringify({ text: resultText }), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
@@ -153,7 +200,7 @@ export async function POST(request) {
         const message = error instanceof Error ? error.message : String(error);
         const status = translationErrorStatus(error);
         const retryAfterMs = Number(error?.retryAfterMs) || (status === 429 ? 8000 : 0);
-        console.error("[Translate API] Failed", {
+        console.warn("[Translate API] Request exhausted its retries", {
             message,
             status,
             retryAfterMs,

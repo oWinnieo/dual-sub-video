@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { transcribeVideo } from '@/lib/asr-engines';
 import {
+  AlertTriangle,
   AudioWaveform,
   BookOpen,
   CheckCircle2,
@@ -115,7 +116,8 @@ const languages = [
 ];
 
 const TRANSLATION_TIMEOUT_MS = 60_000;
-const TRANSLATION_MAX_ATTEMPTS = 2;
+const TRANSLATION_MAX_ATTEMPTS = 3;
+const TRANSLATION_RECOVERY_DELAY_MS = 1800;
 
 // Source selection: NO passthrough "auto" default. Either a real language is
 // chosen, or "Auto-detect" which runs actual language recognition, or "None"
@@ -657,16 +659,128 @@ function IconButton({ label, icon: Icon, active, disabled = false, onClick, tool
 }
 
 function SelectControl({ label, value, onChange, options = languages, disabled = false }) {
+  const selectedLabel = options.find((option) => option.value === value)?.label || value;
+
   return (
-    <label className="select-control">
-      <span>{label}</span>
-      <select value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)}>
+    <label className={`select-control${disabled ? ' disabled' : ''}`}>
+      <span className="select-control-label">{label}</span>
+      <span className="select-control-value" aria-hidden="true">{selectedLabel}</span>
+      <select aria-label={label} value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)}>
         {options.map((language) => (
           <option key={language.value} value={language.value}>{language.label}</option>
         ))}
       </select>
       <ChevronDown size={16} aria-hidden="true" />
     </label>
+  );
+}
+
+function LanguageChangeDialog({ change, cueCount, onCancel, onConfirm }) {
+  if (!change) return null;
+
+  const sourceChange = change.kind === 'source';
+  const previousLabel = sourceChange
+    ? sourceLangLabel(change.previousValue)
+    : languageLabel(change.previousValue);
+  const nextLabel = sourceChange
+    ? sourceLangLabel(change.nextValue)
+    : languageLabel(change.nextValue);
+
+  return (
+    <div className="confirmation-backdrop" role="presentation" onMouseDown={onCancel}>
+      <section
+        className="confirmation-dialog"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="language-change-title"
+        aria-describedby="language-change-description"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="confirmation-icon" aria-hidden="true"><AlertTriangle size={24} /></div>
+        <div className="confirmation-copy">
+          <h2 id="language-change-title">
+            {sourceChange ? 'Regenerate subtitles from the audio?' : 'Translate subtitles again?'}
+          </h2>
+          <p id="language-change-description">
+            {sourceChange
+              ? `Changing the source language from ${previousLabel} to ${nextLabel} will discard the current subtitle result and run speech recognition and translation again.`
+              : `Changing the target language from ${previousLabel} to ${nextLabel} will translate all ${cueCount} existing subtitle cues again. The source text and timing will stay unchanged.`}
+          </p>
+          <div className="confirmation-summary">
+            <span>{previousLabel}</span>
+            <strong aria-hidden="true">→</strong>
+            <span>{nextLabel}</span>
+          </div>
+          <p className="confirmation-note">
+            The video will remain paused and progress will be shown while subtitles are regenerated.
+          </p>
+        </div>
+        <div className="confirmation-actions">
+          <button type="button" className="secondary-action" onClick={onCancel}>Keep current subtitles</button>
+          <button type="button" className="primary-action" onClick={onConfirm}>
+            {sourceChange ? 'Regenerate subtitles' : 'Translate again'}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function RegenerateDialog({ request, item, busy, onChange, onCancel, onConfirm }) {
+  if (!request || !item) return null;
+
+  const hasExistingSubtitles = Boolean(item.cues?.length);
+  const dialogTitle = hasExistingSubtitles ? 'Regenerate subtitles' : 'Create subtitles';
+  const lastDetection = item.detectedLang ? sourceLangLabel(item.detectedLang) : null;
+
+  return (
+    <div className="confirmation-backdrop" role="presentation" onMouseDown={busy ? undefined : onCancel}>
+      <section
+        className="confirmation-dialog regeneration-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="regeneration-title"
+        aria-describedby="regeneration-description"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="confirmation-icon regeneration-icon" aria-hidden="true"><RotateCcw size={24} /></div>
+        <div className="confirmation-copy">
+          <h2 id="regeneration-title">{dialogTitle}</h2>
+          <p id="regeneration-description">
+            {hasExistingSubtitles ? 'Run speech recognition again from the beginning for ' : 'Run speech recognition from the beginning for '}
+            <strong>{item.name}</strong>, then translate every new cue.
+            {hasExistingSubtitles ? ' The current subtitles will only be replaced after the new run succeeds.' : ''}
+          </p>
+          <div className="regeneration-fields">
+            <SelectControl
+              label="Spoken language"
+              value={request.sourceLanguage}
+              onChange={(value) => onChange({ sourceLanguage: value })}
+              options={sourceLanguages.filter((language) => language.value !== 'none')}
+              disabled={busy}
+            />
+            <SelectControl
+              label="Translate to"
+              value={request.targetLanguage}
+              onChange={(value) => onChange({ targetLanguage: value })}
+              disabled={busy}
+            />
+          </div>
+          <p className="confirmation-note regeneration-note">
+            {request.sourceLanguage === 'detect'
+              ? `Auto-detect will inspect the audio again.${lastDetection ? ` The previous run detected ${lastDetection}; choose the actual language above if that was wrong.` : ''}`
+              : `Speech recognition will be forced to ${sourceLangLabel(request.sourceLanguage)} instead of auto-detecting.`}
+          </p>
+        </div>
+        <div className="confirmation-actions">
+          <button type="button" className="secondary-action" disabled={busy} onClick={onCancel}>Cancel</button>
+          <button type="button" className="primary-action" disabled={busy} onClick={onConfirm}>
+            <RotateCcw size={16} />
+            {busy ? 'Starting…' : hasExistingSubtitles ? 'Regenerate from audio' : 'Create subtitles'}
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -745,10 +859,14 @@ export default function Home() {
   const [transcribing, setTranscribing] = useState(false);
   const [transcriptionStatus, setTranscriptionStatus] = useState(null);
   const [processing, setProcessing] = useState(false);
+  const [processingKind, setProcessingKind] = useState('full');
   const [processingStage, setProcessingStage] = useState('');
   const [processingProgress, setProcessingProgress] = useState(0);
   const [activeEngine, setActiveEngine] = useState(null);
   const [targetLang, setTargetLang] = useState('en');
+  const [pendingLanguageChange, setPendingLanguageChange] = useState(null);
+  const [regenerationRequest, setRegenerationRequest] = useState(null);
+  const [regenerationRunning, setRegenerationRunning] = useState(false);
   const [sourceMode, setSourceMode] = useState('transcribe');
   const [subtitleOrigin, setSubtitleOrigin] = useState('demo');
   const [transcriptionTrace, setTranscriptionTrace] = useState([]);
@@ -1272,12 +1390,20 @@ export default function Home() {
       setStatusMessage('Wait for the current transcription or translation job before changing its source language.');
       return;
     }
+    if (nextSource === 'none' && viewStep === 'player' && cues.length && subtitleOrigin !== 'unprocessed') {
+      setStatusMessage('Choose a source language or Auto-detect before regenerating subtitles.');
+      return;
+    }
+    if (viewStep === 'player' && cues.length && subtitleOrigin !== 'unprocessed') {
+      setPendingLanguageChange({
+        kind: 'source',
+        previousValue: sourceLang,
+        nextValue: nextSource,
+      });
+      return;
+    }
     setSourceLang(nextSource);
     setDetectedLang(null);
-    if (viewStep === 'player' && cues.length && subtitleOrigin !== 'unprocessed') {
-      setTranslationDone(false);
-      setStatusMessage(`Source language changed to ${sourceLangLabel(nextSource)}. Re-transcribe the media for new source text, or use Re-translate to keep the existing cues.`);
-    }
   };
 
   const handleTargetLanguageChange = (nextTarget) => {
@@ -1286,11 +1412,40 @@ export default function Home() {
       setStatusMessage('Wait for the current transcription or translation job before changing its target language.');
       return;
     }
-    setTargetLang(nextTarget);
     if (viewStep === 'player' && cues.length && subtitleOrigin !== 'unprocessed') {
-      setTranslationDone(false);
-      setStatusMessage(`Target language changed to ${languageLabel(nextTarget)}. Use Re-translate to update the subtitle text.`);
+      setPendingLanguageChange({
+        kind: 'target',
+        previousValue: targetLang,
+        nextValue: nextTarget,
+      });
+      return;
     }
+    setTargetLang(nextTarget);
+  };
+
+  const cancelLanguageChange = () => {
+    setPendingLanguageChange(null);
+    setStatusMessage('Language change cancelled. The current subtitles were kept.');
+  };
+
+  const confirmLanguageChange = () => {
+    const change = pendingLanguageChange;
+    if (!change) return;
+
+    setPendingLanguageChange(null);
+    setSettingsOpen(false);
+    videoRef.current?.pause();
+    setIsPlaying(false);
+
+    if (change.kind === 'source') {
+      setSourceLang(change.nextValue);
+      setDetectedLang(null);
+      processVideo({ sourceLanguage: change.nextValue, targetLanguage: targetLang });
+      return;
+    }
+
+    setTargetLang(change.nextValue);
+    translateCues({ sourceLanguage: sourceLang, targetLanguage: change.nextValue });
   };
 
   const openPlayer = () => {
@@ -1309,6 +1464,7 @@ export default function Home() {
     setSourceMode('transcribe');
     setSubtitleOrigin('sample');
     setActiveEngine('node-whisper');
+    setProcessingKind('full');
     setProcessing(true);
     setProcessingStage('Running sample smoke test');
     setProcessingProgress(0.08);
@@ -1396,21 +1552,21 @@ export default function Home() {
   // Full "video -> dual subtitles" pipeline, shown behind the loading screen:
   //   1. transcribe with the local native worker, then
   //   2. translate the resulting cues into the target language.
-  const processVideo = async () => {
+  const processVideo = async (options = {}) => {
     const file = mediaFileRef.current;
+    const jobSourceLang = options.sourceLanguage || sourceLang;
+    const jobTargetLang = options.targetLanguage || targetLang;
     if (!file && !mediaPath) {
       setStatusMessage('Import a video or audio file before transcribing.');
       return;
     }
-    if (!sourceLang || sourceLang === 'none') {
+    if (!jobSourceLang || jobSourceLang === 'none') {
       setStatusMessage('Pick a source language or choose "Auto-detect" before transcribing.');
       openSettings('languages');
       return;
     }
     // Lock the language/model selections for this job. UI changes made while
     // the async pipeline is running must only affect the next job.
-    const jobSourceLang = sourceLang;
-    const jobTargetLang = targetLang;
     const jobQuality = quality;
 
     videoRef.current?.pause();
@@ -1423,6 +1579,7 @@ export default function Home() {
     setTranscriptionTrace(createTranscriptionTrace(file, mediaPath));
     setTranscriptionDebug(null);
     processingCancelRef.current = false;
+    setProcessingKind('full');
     setProcessing(true);
     setProcessingProgress(0.02);
     setProcessingStage('Preparing');
@@ -1495,7 +1652,6 @@ export default function Home() {
       const detected = detectedLanguage || null;
       if (jobSourceLang === 'detect' && detected) {
         setDetectedLang(detected);
-        setSourceLang(detected);
       }
       if (autoUpgraded && effectiveQuality === 'best') {
         setQuality('best');
@@ -1541,7 +1697,15 @@ export default function Home() {
 
       const enrichedAsr = asrCues.map(enrichCue);
       setTranslationRunning(true);
-      const translated = await translateList(enrichedAsr, effectiveSource, jobTargetLang);
+      const translated = await translateList(enrichedAsr, effectiveSource, jobTargetLang, (completed, total, recovery) => {
+        if (processingCancelRef.current) return;
+        setProcessingStage(recovery?.recovering
+          ? `Retrying subtitle ${recovery.current} of ${recovery.total}`
+          : `Translating cue ${completed} of ${total} to ${languageLabel(jobTargetLang)}`);
+        setProcessingProgress(recovery?.recovering
+          ? 0.93
+          : 0.62 + (completed / Math.max(1, total)) * 0.3);
+      }, () => processingCancelRef.current);
       setTranslationRunning(false);
 
       if (processingCancelRef.current) return;
@@ -1599,7 +1763,7 @@ export default function Home() {
       const logNote = logPath ? ` Log: ${logPath}.` : '';
       setStatusMessage(translationsReady
         ? `Transcribed ${finalCues.length} cues${engineNote} and translated to ${languageLabel(jobTargetLang)}.${detectNote}${recoveryNote}${logNote}`
-        : `Transcription completed, but ${failedTranslations} translation${failedTranslations === 1 ? '' : 's'} failed after two attempts. Use Re-translate to try again.${logNote}`);
+        : `Transcription completed, but ${failedTranslations} translation${failedTranslations === 1 ? '' : 's'} could not be recovered after automatic retries. Use Re-translate to try again.${logNote}`);
 
       // Move the viewer into the player once dual subs are ready. The video
       // stays paused — press Play whenever you're ready.
@@ -1647,17 +1811,26 @@ export default function Home() {
     setTranscribing(false);
     setTranslationRunning(false);
     setTranslationDone(false);
-    setStatusMessage('Transcription cancelled. You can adjust settings and try again.');
+    setStatusMessage(processingKind === 'translation'
+      ? 'Subtitle translation cancelled. The selected language is saved; use Re-translate when you are ready.'
+      : 'Transcription cancelled. You can adjust settings and try again.');
   };
 
   // Background transcription for a library item (no full-screen overlay), so
   // a whole folder of videos can be processed while you keep watching.
-  const transcribeLibraryItem = async (item) => {
-    if (!item?.file || item.status === 'processing' || item.cues?.length) return false;
-    const jobSourceLang = sourceLang;
-    const jobTargetLang = targetLang;
-    const jobQuality = quality;
-    updateLibraryItem(item.id, { status: 'processing', progress: 2, stage: 'Preparing', error: null });
+  const transcribeLibraryItem = async (item, options = {}) => {
+    if (!item?.file || item.status === 'processing' || (!options.force && item.cues?.length)) return false;
+    const jobSourceLang = options.sourceLanguage || item.sourceLanguage || sourceLang;
+    const jobTargetLang = options.targetLanguage || item.translatedTo || targetLang;
+    const jobQuality = options.quality || quality;
+    updateLibraryItem(item.id, {
+      status: 'processing',
+      progress: 2,
+      stage: options.force ? 'Preparing regeneration' : 'Preparing',
+      error: null,
+      sourceLanguage: jobSourceLang,
+      translatedTo: jobTargetLang,
+    });
     try {
       const { cues: asrCues, detectedLanguage } = await transcribeVideo(item.file, {
         engine: 'node-whisper',
@@ -1681,29 +1854,75 @@ export default function Home() {
       const finalCues = normalizeCuesForPlayback(translated);
       const failedTranslations = countTranslationFailures(finalCues);
       const translationsReady = failedTranslations === 0;
+      const keepPreviousResult = options.force && !translationsReady && Boolean(item.cues?.length);
 
       updateLibraryItem(item.id, {
         status: translationsReady ? 'done' : 'failed',
         progress: translationsReady ? 100 : 90,
         stage: translationsReady ? 'Ready' : 'Translation failed',
         error: translationsReady ? null : `${failedTranslations} subtitle translation${failedTranslations === 1 ? '' : 's'} failed.`,
-        cues: finalCues,
-        detectedLang: detectedLanguage || null,
+        cues: keepPreviousResult ? item.cues : finalCues,
+        detectedLang: keepPreviousResult ? item.detectedLang : (detectedLanguage || null),
         sourceLanguage: jobSourceLang,
         translatedTo: jobTargetLang,
       });
       // If this video is on screen right now, show its fresh subtitles.
-      if (activeItemIdRef.current === item.id) {
+      if (activeItemIdRef.current === item.id && !keepPreviousResult) {
         setCues(finalCues);
         setTranslationDone(translationsReady);
         setSubtitleOrigin('transcription');
         setDetectedLang(detectedLanguage || null);
+        setSourceLang(jobSourceLang);
+        setTargetLang(jobTargetLang);
+        setPlaybackTime(finalCues[0]?.start ?? 0);
+        setSelectedWord(finalCues[0]?.words?.[0] ?? null);
         if (translationsReady) recordSubtitleLog(finalCues, 'transcribe', item.name);
       }
       return translationsReady;
     } catch (error) {
       updateLibraryItem(item.id, { status: 'failed', stage: 'Failed', error: error.message });
       return false;
+    }
+  };
+
+  const openRegenerationDialog = (item) => {
+    if (!item) return;
+    if (processing || batchRunning || regenerationRunning || item.status === 'processing') {
+      setStatusMessage('Wait for the current subtitle job to finish before starting another regeneration.');
+      return;
+    }
+    setRegenerationRequest({
+      itemId: item.id,
+      sourceLanguage: item.sourceLanguage || sourceLang || 'detect',
+      targetLanguage: item.translatedTo || targetLang,
+    });
+  };
+
+  const confirmLibraryRegeneration = async () => {
+    const request = regenerationRequest;
+    const item = libraryRef.current.find((entry) => entry.id === request?.itemId);
+    if (!request || !item || regenerationRunning) return;
+
+    setRegenerationRunning(true);
+    setRegenerationRequest(null);
+    if (activeItemIdRef.current === item.id) {
+      videoRef.current?.pause();
+      setIsPlaying(false);
+      setSourceLang(request.sourceLanguage);
+      setTargetLang(request.targetLanguage);
+    }
+    setStatusMessage(`Regenerating subtitles for ${item.name} from ${sourceLangLabel(request.sourceLanguage)}…`);
+    try {
+      const succeeded = await transcribeLibraryItem(item, {
+        force: true,
+        sourceLanguage: request.sourceLanguage,
+        targetLanguage: request.targetLanguage,
+      });
+      setStatusMessage(succeeded
+        ? `Regenerated subtitles for ${item.name} from ${sourceLangLabel(request.sourceLanguage)} and translated them to ${languageLabel(request.targetLanguage)}.`
+        : `Regeneration did not complete for ${item.name}. The previous subtitles were kept; open the library to review the error and try again.`);
+    } finally {
+      setRegenerationRunning(false);
     }
   };
 
@@ -1891,7 +2110,7 @@ export default function Home() {
   // Translate an explicit list of cues and return the translated array. Shared
   // by the "Batch translate" button and the transcribe->translate pipeline so
   // both use identical batching/fallback behaviour.
-  const translateList = async (list, effectiveSource, target) => {
+  const translateList = async (list, effectiveSource, target, onProgress, shouldCancel = () => false) => {
     const translateOne = async (cue) => {
       const translationContext = {
         cueId: cue.id,
@@ -1920,7 +2139,13 @@ export default function Home() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             signal: controller.signal,
-            body: JSON.stringify({ text: cue.original, from: effectiveSource, to: target, llmModel: 'none' }),
+            body: JSON.stringify({
+              text: cue.original,
+              from: effectiveSource,
+              to: target,
+              llmModel: 'none',
+              useCache: cacheEnabled,
+            }),
           });
 
           if (response.ok) {
@@ -1928,7 +2153,7 @@ export default function Home() {
             const translatedText = typeof data.text === 'string' ? data.text.trim() : '';
             if (!translatedText) {
               lastFailure = 'The translation API returned an empty result.';
-              console.error('[Translation] Failed: API returned an empty translation', {
+              console.warn('[Translation] Empty response; cue will be retried', {
                 ...translationContext,
                 attempt,
                 status: response.status,
@@ -1965,9 +2190,11 @@ export default function Home() {
           }
           retryAfterMs = response.status === 429
             ? Math.max(1000, Number(errorData?.retryAfterMs) || Number(response.headers.get('Retry-After')) * 1000 || 8000)
-            : 0;
+            : response.status >= 500
+              ? 1200 * attempt
+              : 600;
           lastFailure = `Translation API returned HTTP ${response.status}${errorBody ? `: ${errorBody}` : ''}`;
-          console.error('[Translation] Failed: API returned an error', {
+          console.warn('[Translation] Request failed; cue will be retried when eligible', {
             ...translationContext,
             attempt,
             status: response.status,
@@ -1978,7 +2205,7 @@ export default function Home() {
           lastFailure = aborted
             ? `Translation timed out after ${TRANSLATION_TIMEOUT_MS / 1000} seconds.`
             : (error instanceof Error ? error.message : String(error));
-          console.error('[Translation] Failed: request threw an exception', {
+          console.warn('[Translation] Request exception; cue will be retried', {
             ...translationContext,
             attempt,
             error: lastFailure,
@@ -2001,7 +2228,7 @@ export default function Home() {
         }
       }
 
-      console.error('[Translation] Failed after all attempts', {
+      console.warn('[Translation] Cue still failed after this pass', {
         ...translationContext,
         attempts: TRANSLATION_MAX_ATTEMPTS,
         error: lastFailure,
@@ -2018,13 +2245,42 @@ export default function Home() {
     const maxWorkers = Math.max(1, Math.min(12, Number(concurrency) || 4));
     const results = new Array(list.length);
     let nextIndex = 0;
+    let completedCount = 0;
     const worker = async () => {
       while (nextIndex < list.length) {
         const index = nextIndex++;
         results[index] = await translateOne(list[index]);
+        completedCount += 1;
+        onProgress?.(completedCount, list.length);
       }
     };
     await Promise.all(Array.from({ length: Math.min(maxWorkers, list.length) }, worker));
+
+    // A large batch can still contain a few transient failures after its
+    // concurrent pass. Retry only those cues, one at a time, after a short
+    // cooldown so an intermittent upstream limit does not fail the project.
+    const initiallyFailedIndexes = results.reduce((indexes, cue, index) => {
+      if (cue?.translationError) indexes.push(index);
+      return indexes;
+    }, []);
+    if (initiallyFailedIndexes.length && !shouldCancel()) {
+      console.warn('[Translation] Retrying failed cues sequentially', {
+        failed: initiallyFailedIndexes.length,
+        total: results.length,
+      });
+      await new Promise((resolve) => window.setTimeout(resolve, TRANSLATION_RECOVERY_DELAY_MS));
+      for (let recoveryIndex = 0; recoveryIndex < initiallyFailedIndexes.length; recoveryIndex += 1) {
+        if (shouldCancel()) break;
+        const cueIndex = initiallyFailedIndexes[recoveryIndex];
+        onProgress?.(
+          results.length,
+          results.length,
+          { recovering: true, current: recoveryIndex + 1, total: initiallyFailedIndexes.length },
+        );
+        results[cueIndex] = await translateOne(results[cueIndex]);
+      }
+    }
+
     const failed = countTranslationFailures(results);
     const summary = {
       from: effectiveSource,
@@ -2033,14 +2289,14 @@ export default function Home() {
       succeeded: results.length - failed,
       failed,
     };
-    if (failed) console.error('[Translation] Batch completed with failures', summary);
+    if (failed) console.warn('[Translation] Batch completed with unrecovered cues', summary);
     else console.log('[Translation] Batch completed successfully', summary);
     return results;
   };
 
-  const translateCues = async () => {
-    const jobSourceLang = sourceLang;
-    const jobTargetLang = targetLang;
+  const translateCues = async (options = {}) => {
+    const jobSourceLang = options.sourceLanguage || sourceLang;
+    const jobTargetLang = options.targetLanguage || targetLang;
     // Never send the 'detect'/'none' sentinels to the translator. Use the
     // recognised language when we have it, otherwise let the translator
     // auto-detect the source ('auto').
@@ -2054,9 +2310,26 @@ export default function Home() {
     setStatusMessage(`Batch translating ${cues.length} cues from ${sourceLangLabel(effectiveSource)} to ${languageLabel(jobTargetLang)} with concurrency ${concurrency}.`);
     setTranslationDone(false);
     setTranslationRunning(true);
+    processingCancelRef.current = false;
+    setProcessingKind('translation');
+    setProcessingStage(`Preparing ${cues.length} subtitle cues`);
+    setProcessingProgress(0.05);
+    setProcessing(true);
 
     try {
-      const translated = await translateList(cues, effectiveSource, jobTargetLang);
+      const translated = await translateList(cues, effectiveSource, jobTargetLang, (completed, total, recovery) => {
+        if (processingCancelRef.current) return;
+        setProcessingStage(recovery?.recovering
+          ? `Retrying subtitle ${recovery.current} of ${recovery.total}`
+          : `Translating cue ${completed} of ${total} to ${languageLabel(jobTargetLang)}`);
+        setProcessingProgress(recovery?.recovering
+          ? 0.93
+          : 0.08 + (completed / Math.max(1, total)) * 0.84);
+      }, () => processingCancelRef.current);
+      if (processingCancelRef.current) return;
+
+      setProcessingStage('Finalizing regenerated subtitles');
+      setProcessingProgress(0.96);
       const finalCues = normalizeCuesForPlayback(translated);
       const failedTranslations = countTranslationFailures(finalCues);
       const translationsReady = failedTranslations === 0;
@@ -2080,10 +2353,18 @@ export default function Home() {
           ? `Translations to ${languageLabel(jobTargetLang)} are ready. Repeated lines will hit cache on re-run.`
           : `Translations to ${languageLabel(jobTargetLang)} are ready. Cache is disabled.`);
       } else {
-        setStatusMessage(`${failedTranslations} translation${failedTranslations === 1 ? '' : 's'} failed after two attempts. Playback and export remain locked; use Re-translate to try again.`);
+        setStatusMessage(`${failedTranslations} translation${failedTranslations === 1 ? '' : 's'} could not be recovered after automatic retries. Playback and export remain locked; use Re-translate to try again.`);
+      }
+      setProcessingProgress(1);
+      setProcessingStage(translationsReady ? 'Subtitles ready' : 'Translation completed with errors');
+    } catch (error) {
+      if (!processingCancelRef.current) {
+        setProcessingStage('Translation failed');
+        setStatusMessage(`Translation failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     } finally {
       setTranslationRunning(false);
+      window.setTimeout(() => setProcessing(false), 450);
     }
   };
 
@@ -2168,25 +2449,33 @@ export default function Home() {
         <div className="processing-overlay" role="status" aria-live="polite">
           <div className="processing-card">
             <div className="processing-spinner" aria-hidden="true"><AudioWaveform size={30} /></div>
-            <h2>Processing your video</h2>
+            <h2>{processingKind === 'translation' ? 'Regenerating translated subtitles' : 'Processing your video'}</h2>
             <p className="processing-file">{mediaName}</p>
             <div className="processing-bar">
               <div className="processing-bar-fill" style={{ width: `${Math.round(processingProgress * 100)}%` }} />
             </div>
             <p className="processing-stage">
               {processingStage || 'Working'}
-              {activeEngine ? ' · local Whisper' : ''}
+              {processingKind === 'full' && activeEngine ? ' · local Whisper' : ''}
               {` · ${Math.round(processingProgress * 100)}%`}
             </p>
-            <ol className="processing-steps">
-              <li className={processingProgress > 0.1 ? 'done' : 'active'}>Extract audio</li>
-              <li className={processingProgress >= 0.6 ? 'done' : processingProgress > 0.1 ? 'active' : ''}>
-                Transcribe {sourceLang === 'detect' ? '(auto-detect)' : `(${sourceLangLabel(sourceLang)})`}
-              </li>
-              <li className={processingProgress >= 1 ? 'done' : processingProgress >= 0.6 ? 'active' : ''}>
-                Translate to {languageLabel(targetLang)}
-              </li>
-            </ol>
+            {processingKind === 'translation' ? (
+              <ol className="processing-steps">
+                <li className="done">Keep source text and timing</li>
+                <li className={processingProgress >= 0.96 ? 'done' : 'active'}>Translate all cues to {languageLabel(targetLang)}</li>
+                <li className={processingProgress >= 1 ? 'done' : processingProgress >= 0.96 ? 'active' : ''}>Refresh subtitles in the player</li>
+              </ol>
+            ) : (
+              <ol className="processing-steps">
+                <li className={processingProgress > 0.1 ? 'done' : 'active'}>Extract audio</li>
+                <li className={processingProgress >= 0.6 ? 'done' : processingProgress > 0.1 ? 'active' : ''}>
+                  Transcribe {sourceLang === 'detect' ? '(auto-detect)' : `(${sourceLangLabel(sourceLang)})`}
+                </li>
+                <li className={processingProgress >= 1 ? 'done' : processingProgress >= 0.6 ? 'active' : ''}>
+                  Translate to {languageLabel(targetLang)}
+                </li>
+              </ol>
+            )}
             <button type="button" className="secondary-action processing-cancel" onClick={cancelProcessing}>Cancel</button>
           </div>
         </div>
@@ -2333,7 +2622,7 @@ export default function Home() {
                   icon={Languages}
                   active={!translationDone || translationRunning}
                   disabled={!cues.length || translationRunning || transcribing || processing}
-                  onClick={translateCues}
+                  onClick={() => translateCues()}
                 />
                 <IconButton
                   label={subtitleLog ? `Download session subtitle log (${subtitleLog.cueCount} cues)` : 'No session subtitle log yet'}
@@ -2664,7 +2953,7 @@ export default function Home() {
             <div className="library-head">
               <div>
                 <strong>Your library</strong>
-                <span>Every video you&apos;ve added. Click one to watch or transcribe it.</span>
+                <span>Watch a video, correct its language, or regenerate its subtitles.</span>
               </div>
               <button type="button" className="icon-button" aria-label="Close library" onClick={() => setLibraryOpen(false)}><X size={18} /></button>
             </div>
@@ -2685,7 +2974,13 @@ export default function Home() {
             </div>
             <div className="library-list">
               {library.length ? library.map((item) => {
-                const deleteDisabled = processing || batchRunning || item.status === 'processing';
+                const itemBusy = processing || batchRunning || regenerationRunning || item.status === 'processing';
+                const sourceSummary = item.sourceLanguage === 'detect'
+                  ? (item.detectedLang ? `Detected ${sourceLangLabel(item.detectedLang)}` : 'Auto-detect')
+                  : item.sourceLanguage ? sourceLangLabel(item.sourceLanguage) : 'Not generated';
+                const languageSummary = item.translatedTo
+                  ? `${sourceSummary} → ${languageLabel(item.translatedTo)}`
+                  : sourceSummary;
                 return (
                   <article key={item.id} className={`library-item-row${item.id === activeItemId ? ' active' : ''}`}>
                     <button
@@ -2701,20 +2996,34 @@ export default function Home() {
                             : item.status === 'failed' ? `Failed: ${item.error}`
                               : 'Waiting — no subtitles yet'}
                       </small>
+                      <span className="library-item-languages">{languageSummary}</span>
                       {item.status === 'processing' ? (
                         <span className="mini-progress"><span style={{ width: `${item.progress}%` }} /></span>
                       ) : null}
                     </button>
-                    <button
-                      type="button"
-                      className="library-delete-button"
-                      aria-label={`Remove ${item.name} from library`}
-                      title={deleteDisabled ? 'Available after subtitle processing finishes' : `Remove ${item.name} from library`}
-                      disabled={deleteDisabled}
-                      onClick={() => removeLibraryItem(item)}
-                    >
-                      <Trash2 size={17} />
-                    </button>
+                    <div className="library-item-controls">
+                      <button
+                        type="button"
+                        className="library-regenerate-button"
+                        aria-label={`${item.cues?.length ? 'Regenerate' : 'Create'} subtitles for ${item.name}`}
+                        title={itemBusy ? 'Available after subtitle processing finishes' : 'Choose the spoken language and generate subtitles again from the audio'}
+                        disabled={itemBusy}
+                        onClick={() => openRegenerationDialog(item)}
+                      >
+                        <RotateCcw size={15} />
+                        <span>{item.cues?.length ? 'Regenerate' : 'Create'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="library-delete-button"
+                        aria-label={`Remove ${item.name} from library`}
+                        title={itemBusy ? 'Available after subtitle processing finishes' : `Remove ${item.name} from library`}
+                        disabled={itemBusy}
+                        onClick={() => removeLibraryItem(item)}
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
                   </article>
                 );
               }) : (
@@ -3001,6 +3310,21 @@ export default function Home() {
           </aside>
         </div>
       ) : null}
+
+      <LanguageChangeDialog
+        change={pendingLanguageChange}
+        cueCount={cues.length}
+        onCancel={cancelLanguageChange}
+        onConfirm={confirmLanguageChange}
+      />
+      <RegenerateDialog
+        request={regenerationRequest}
+        item={library.find((entry) => entry.id === regenerationRequest?.itemId)}
+        busy={regenerationRunning}
+        onChange={(patch) => setRegenerationRequest((current) => current ? { ...current, ...patch } : current)}
+        onCancel={() => setRegenerationRequest(null)}
+        onConfirm={confirmLibraryRegeneration}
+      />
     </main>
   );
 }
