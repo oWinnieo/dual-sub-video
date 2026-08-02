@@ -9,6 +9,7 @@
     "dev": "next dev",
     "dev:hybrid": "concurrently \"next dev\" \"wait-on http://localhost:3000 && electron .\"",
     "build": "next build --webpack",
+    "test": "node --test test/*.test.js",
     "start": "next start",
     "lint": "eslint",
     "electron:dev": "concurrently \"next dev\" \"wait-on http://localhost:3000 && electron .\"",

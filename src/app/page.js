@@ -118,6 +118,9 @@ const languages = [
 const TRANSLATION_TIMEOUT_MS = 60_000;
 const TRANSLATION_MAX_ATTEMPTS = 3;
 const TRANSLATION_RECOVERY_DELAY_MS = 1800;
+const PROGRESSIVE_FIRST_SEGMENT_SECONDS = 2 * 60;
+const PROGRESSIVE_SEGMENT_SECONDS = 3 * 60;
+const PROGRESS_NOTICE_AUTO_HIDE_MS = 8_000;
 
 // Source selection: NO passthrough "auto" default. Either a real language is
 // chosen, or "Auto-detect" which runs actual language recognition, or "None"
@@ -642,11 +645,11 @@ function parseBatchManifest(name, text) {
     .map((line, index) => makeQueueItem(line, index));
 }
 
-function IconButton({ label, icon: Icon, active, disabled = false, onClick, tooltip = false }) {
+function IconButton({ label, icon: Icon, active, disabled = false, onClick, tooltip = false, className = '' }) {
   return (
     <button
       type="button"
-      className={`icon-button${active ? ' active' : ''}${tooltip ? ' tooltip-control' : ''}`}
+      className={`icon-button${active ? ' active' : ''}${tooltip ? ' tooltip-control' : ''}${className ? ` ${className}` : ''}`}
       aria-label={label}
       title={tooltip ? undefined : label}
       data-tooltip={tooltip ? label : undefined}
@@ -839,8 +842,10 @@ export default function Home() {
   const simulationRef = useRef(null);
   const maskDragRef = useRef(null);
   const controlsTimerRef = useRef(null);
+  const progressNoticeTimerRef = useRef(null);
   const mediaFileRef = useRef(null);
   const processingCancelRef = useRef(false);
+  const transcriptionAbortRef = useRef(null);
   const activeItemIdRef = useRef(null);
   const libraryRef = useRef([]);
   const [viewStep, setViewStep] = useState('landing');
@@ -853,6 +858,7 @@ export default function Home() {
   const [settingsTab, setSettingsTab] = useState('subtitles');
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
+  const [progressNoticeVisible, setProgressNoticeVisible] = useState(true);
   const [mode, setMode] = useState('education');
   const [sourceLang, setSourceLang] = useState('detect');
   const [detectedLang, setDetectedLang] = useState(null);
@@ -862,6 +868,7 @@ export default function Home() {
   const [processingKind, setProcessingKind] = useState('full');
   const [processingStage, setProcessingStage] = useState('');
   const [processingProgress, setProcessingProgress] = useState(0);
+  const [progressiveJob, setProgressiveJob] = useState(null);
   const [activeEngine, setActiveEngine] = useState(null);
   const [targetLang, setTargetLang] = useState('en');
   const [pendingLanguageChange, setPendingLanguageChange] = useState(null);
@@ -943,11 +950,11 @@ export default function Home() {
   }, [queue]);
   const dueCards = savedCards.filter((card) => card.fsrs.due <= Date.now()).length;
   const whisperReady = Boolean(transcriptionStatus?.ready);
+  const progressivePlaybackReady = Boolean(progressiveJob?.processedThrough > 0 && cues.length);
   const playbackReady = Boolean(
     cues.length
-    && translationDone
+    && (translationDone || progressivePlaybackReady)
     && subtitleOrigin !== 'unprocessed'
-    && !transcribing
     && !processing,
   );
   const pendingCount = useMemo(
@@ -982,7 +989,9 @@ export default function Home() {
   useEffect(() => () => {
     if (simulationRef.current) window.clearInterval(simulationRef.current);
     if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
+    if (progressNoticeTimerRef.current) window.clearTimeout(progressNoticeTimerRef.current);
     if (playbackSyncFrameRef.current) window.cancelAnimationFrame(playbackSyncFrameRef.current);
+    transcriptionAbortRef.current?.abort();
   }, []);
 
   useEffect(() => {
@@ -1112,7 +1121,7 @@ export default function Home() {
       if (playbackSyncFrameRef.current) window.cancelAnimationFrame(playbackSyncFrameRef.current);
       playbackSyncFrameRef.current = null;
     };
-  }, [isPlaying, mediaUrl]);
+  }, [isPlaying, mediaUrl, playbackReady]);
 
   // VLC-style keyboard shortcuts (player view only, not while typing).
   useEffect(() => {
@@ -1301,6 +1310,7 @@ export default function Home() {
   const selectLibraryItem = (item, options = {}) => {
     if (!item) return;
     videoRef.current?.pause();
+    setProgressiveJob(item.progressiveJob || null);
     activeItemIdRef.current = item.id;
     setActiveItemId(item.id);
     mediaFileRef.current = item.file || null;
@@ -1554,6 +1564,7 @@ export default function Home() {
   //   2. translate the resulting cues into the target language.
   const processVideo = async (options = {}) => {
     const file = mediaFileRef.current;
+    const jobItemId = activeItemIdRef.current;
     const jobSourceLang = options.sourceLanguage || sourceLang;
     const jobTargetLang = options.targetLanguage || targetLang;
     if (!file && !mediaPath) {
@@ -1578,11 +1589,16 @@ export default function Home() {
     setSubtitleOrigin('unprocessed');
     setTranscriptionTrace(createTranscriptionTrace(file, mediaPath));
     setTranscriptionDebug(null);
+    setProgressiveJob(null);
     processingCancelRef.current = false;
+    const transcriptionController = new AbortController();
+    transcriptionAbortRef.current = transcriptionController;
     setProcessingKind('full');
     setProcessing(true);
     setProcessingProgress(0.02);
     setProcessingStage('Preparing');
+    let streamedTranslatedCues = [];
+    let streamedDetectedLanguage = null;
 
     try {
       updateTranscriptionTrace('preflight', 'running', 'Checking the local native transcription worker.');
@@ -1616,13 +1632,18 @@ export default function Home() {
         status,
         logPath,
         job,
+        durationSeconds: transcribedDuration,
+        firstSegmentSeconds: transcribedFirstSegmentSeconds,
+        totalSegments: transcribedSegmentCount,
       } = await transcribeVideo(file, {
         engine: 'node-whisper',
         language: jobSourceLang,
         quality: jobQuality,
         mediaPath,
+        progressive: true,
+        signal: transcriptionController.signal,
         onEngine: (eng) => setActiveEngine(eng),
-        onProgress: (fraction, stage) => {
+        onProgress: (fraction, stage, progressEvent) => {
           if (processingCancelRef.current) return;
           const normalizedStage = String(stage || '').toLowerCase();
           if (normalizedStage.includes('upload') || normalizedStage.includes('desktop path')) {
@@ -1635,8 +1656,105 @@ export default function Home() {
             updateTranscriptionTrace('cues', 'running', 'Reading timestamped cue data.');
           }
           setProcessingStage(stage || 'Transcribing');
-          // Transcription occupies the first ~55% of the bar.
-          setProcessingProgress(Math.min(0.55, 0.1 + fraction * 0.45));
+          setProcessingProgress(Math.min(0.96, fraction));
+          if (progressEvent?.totalSegments) {
+            const completedSegments = progressEvent.type === 'segment'
+              ? progressEvent.index + 1
+              : progressEvent.index;
+            const processedThrough = progressEvent.type === 'segment'
+              ? progressEvent.end
+              : progressEvent.start;
+            const nextJob = {
+              active: true,
+              isLong: progressEvent.totalSegments > 1,
+              firstSegmentSeconds: progressEvent.firstSegmentSeconds || PROGRESSIVE_FIRST_SEGMENT_SECONDS,
+              segmentSeconds: PROGRESSIVE_SEGMENT_SECONDS,
+              totalSegments: progressEvent.totalSegments,
+              completedSegments,
+              processedThrough,
+              duration: progressEvent.durationSeconds || duration,
+              stage: stage || 'Transcribing',
+              percent: Math.round(fraction * 100),
+            };
+            setProgressiveJob((current) => ({ ...current, ...nextJob }));
+            if (activeItemIdRef.current) {
+              updateLibraryItem(activeItemIdRef.current, {
+                status: 'processing',
+                progress: nextJob.percent,
+                stage: nextJob.stage,
+                progressiveJob: nextJob,
+              });
+            }
+          }
+        },
+        onSegment: async (segment) => {
+          if (processingCancelRef.current || !segment.cues?.length) return;
+          const segmentDetected = segment.detectedLanguage || streamedDetectedLanguage;
+          streamedDetectedLanguage = segmentDetected;
+          const effectiveSource = (jobSourceLang === 'detect' || jobSourceLang === 'none')
+            ? (segmentDetected || 'auto')
+            : jobSourceLang;
+          setProcessingStage(`Translating segment ${segment.index + 1} of ${segment.totalSegments}`);
+          setTranslationRunning(true);
+          const translatedSegment = await translateList(
+            segment.cues.map(enrichCue),
+            effectiveSource,
+            jobTargetLang,
+            (completed, total) => {
+              setProcessingStage(`Translating segment ${segment.index + 1} of ${segment.totalSegments} · cue ${completed} of ${total}`);
+            },
+            () => processingCancelRef.current,
+            { maxAttempts: 2, timeoutMs: 20_000, recoverFailures: false },
+          );
+          setTranslationRunning(false);
+          if (processingCancelRef.current) return;
+
+          const hadPlayableCues = streamedTranslatedCues.length > 0;
+          streamedTranslatedCues = normalizeCuesForPlayback([
+            ...streamedTranslatedCues,
+            ...translatedSegment,
+          ]);
+          const completedSegments = segment.index + 1;
+          const processedThrough = segment.end;
+          const percent = Math.round((completedSegments / segment.totalSegments) * 100);
+          const nextProgressiveJob = {
+            active: completedSegments < segment.totalSegments,
+            isLong: segment.totalSegments > 1,
+            firstSegmentSeconds: segment.firstSegmentSeconds || PROGRESSIVE_FIRST_SEGMENT_SECONDS,
+            segmentSeconds: PROGRESSIVE_SEGMENT_SECONDS,
+            totalSegments: segment.totalSegments,
+            completedSegments,
+            processedThrough,
+            duration: segment.durationSeconds || duration,
+            stage: completedSegments < segment.totalSegments
+              ? `第 ${completedSegments + 1}/${segment.totalSegments} 段正在后台生成`
+              : '全部分段已生成',
+            percent,
+          };
+          setCues(streamedTranslatedCues);
+          setSourceMode('transcribe');
+          setSubtitleOrigin('transcription');
+          setDetectedLang(segmentDetected || null);
+          setProgressiveJob(nextProgressiveJob);
+          if (!hadPlayableCues && streamedTranslatedCues.length) {
+            setPlaybackTime(streamedTranslatedCues[0]?.start ?? 0);
+            setSelectedWord(streamedTranslatedCues[0]?.words?.[0] ?? null);
+            setViewStep('player');
+            setProcessing(false);
+            setStatusMessage(`前 ${clockShort(processedThrough)} 的双语字幕已生成，可以开始观看；剩余内容会在后台继续生成。`);
+          }
+          if (activeItemIdRef.current) {
+            updateLibraryItem(activeItemIdRef.current, {
+              status: completedSegments < segment.totalSegments ? 'processing' : 'done',
+              progress: percent,
+              stage: nextProgressiveJob.stage,
+              cues: streamedTranslatedCues,
+              detectedLang: segmentDetected || null,
+              sourceLanguage: jobSourceLang,
+              translatedTo: jobTargetLang,
+              progressiveJob: nextProgressiveJob,
+            });
+          }
         },
       });
 
@@ -1687,26 +1805,33 @@ export default function Home() {
       );
 
       // --- Stage 2: translation ---------------------------------------------
-      setProcessingStage(`Translating to ${languageLabel(jobTargetLang)}`);
-      setProcessingProgress(0.62);
-      updateTranscriptionTrace('translation', 'running', `Translating ${asrCues.length} real source cues.`);
+      // Progressive jobs translate each chunk as soon as it arrives.
+      // Short clips still take the original single-pass translation path.
+      let translated = streamedTranslatedCues;
+      if (!translated.length) {
+        setProcessingStage(`Translating to ${languageLabel(jobTargetLang)}`);
+        setProcessingProgress(0.62);
+        updateTranscriptionTrace('translation', 'running', `Translating ${asrCues.length} real source cues.`);
 
-      const effectiveSource = (jobSourceLang === 'detect' || jobSourceLang === 'none')
-        ? (detected || 'auto')
-        : jobSourceLang;
+        const effectiveSource = (jobSourceLang === 'detect' || jobSourceLang === 'none')
+          ? (detected || 'auto')
+          : jobSourceLang;
 
-      const enrichedAsr = asrCues.map(enrichCue);
-      setTranslationRunning(true);
-      const translated = await translateList(enrichedAsr, effectiveSource, jobTargetLang, (completed, total, recovery) => {
-        if (processingCancelRef.current) return;
-        setProcessingStage(recovery?.recovering
-          ? `Retrying subtitle ${recovery.current} of ${recovery.total}`
-          : `Translating cue ${completed} of ${total} to ${languageLabel(jobTargetLang)}`);
-        setProcessingProgress(recovery?.recovering
-          ? 0.93
-          : 0.62 + (completed / Math.max(1, total)) * 0.3);
-      }, () => processingCancelRef.current);
-      setTranslationRunning(false);
+        const enrichedAsr = asrCues.map(enrichCue);
+        setTranslationRunning(true);
+        translated = await translateList(enrichedAsr, effectiveSource, jobTargetLang, (completed, total, recovery) => {
+          if (processingCancelRef.current) return;
+          setProcessingStage(recovery?.recovering
+            ? `Retrying subtitle ${recovery.current} of ${recovery.total}`
+            : `Translating cue ${completed} of ${total} to ${languageLabel(jobTargetLang)}`);
+          setProcessingProgress(recovery?.recovering
+            ? 0.93
+            : 0.62 + (completed / Math.max(1, total)) * 0.3);
+        }, () => processingCancelRef.current);
+        setTranslationRunning(false);
+      } else {
+        updateTranscriptionTrace('translation', 'running', `Translated ${translated.length} cues progressively by segment.`);
+      }
 
       if (processingCancelRef.current) return;
 
@@ -1716,12 +1841,33 @@ export default function Home() {
       const finalCues = normalizeCuesForPlayback(translated);
       const failedTranslations = countTranslationFailures(finalCues);
       const translationsReady = failedTranslations === 0;
+      const completedProgressiveJob = streamedTranslatedCues.length ? {
+        isLong: (transcribedSegmentCount || 1) > 1,
+        firstSegmentSeconds: transcribedFirstSegmentSeconds || PROGRESSIVE_FIRST_SEGMENT_SECONDS,
+        segmentSeconds: PROGRESSIVE_SEGMENT_SECONDS,
+        totalSegments: transcribedSegmentCount || 1,
+        completedSegments: transcribedSegmentCount || 1,
+        processedThrough: transcribedDuration || finalCues[finalCues.length - 1]?.end || 0,
+        duration: transcribedDuration || duration,
+      } : null;
       setCues(finalCues);
       setSourceMode('transcribe');
       setTranslationDone(translationsReady);
-      setPlaybackTime(finalCues[0]?.start ?? 0);
-      setSelectedWord(finalCues[0]?.words?.[0] ?? null);
+      if (!streamedTranslatedCues.length) {
+        setPlaybackTime(finalCues[0]?.start ?? 0);
+        setSelectedWord(finalCues[0]?.words?.[0] ?? null);
+      }
       setSubtitleOrigin('transcription');
+      if (streamedTranslatedCues.length) {
+        setProgressiveJob((current) => ({
+          ...current,
+          active: false,
+          completedSegments: transcribedSegmentCount || current?.totalSegments || current?.completedSegments || 1,
+          processedThrough: transcribedDuration || finalCues[finalCues.length - 1]?.end || current?.processedThrough || 0,
+          percent: 100,
+          stage: '全部分段已生成',
+        }));
+      }
       if (translationsReady) recordSubtitleLog(finalCues, 'transcribe');
       if (activeItemIdRef.current) {
         updateLibraryItem(activeItemIdRef.current, {
@@ -1733,6 +1879,14 @@ export default function Home() {
           detectedLang: detected,
           sourceLanguage: jobSourceLang,
           translatedTo: jobTargetLang,
+          progressiveJob: completedProgressiveJob ? {
+            ...completedProgressiveJob,
+            active: false,
+            completedSegments: completedProgressiveJob.totalSegments || completedProgressiveJob.completedSegments || 1,
+            processedThrough: duration || finalCues[finalCues.length - 1]?.end || completedProgressiveJob.processedThrough || 0,
+            percent: 100,
+            stage: '全部分段已生成',
+          } : null,
         });
       }
       updateTranscriptionTrace(
@@ -1768,7 +1922,7 @@ export default function Home() {
       // Move the viewer into the player once dual subs are ready. The video
       // stays paused — press Play whenever you're ready.
       setViewStep('player');
-      setIsPlaying(false);
+      if (!streamedTranslatedCues.length) setIsPlaying(false);
     } catch (error) {
       if (!processingCancelRef.current) {
         const nativeStage = error.job?.stage || error.stage || 'native-pipeline';
@@ -1780,6 +1934,20 @@ export default function Home() {
             : 'native';
         updateTranscriptionTrace(traceStage, 'failed', error.message);
         setTranscriptionDebug({ error: error.message, job: error.job || null, status: error.statusInfo || null });
+        if (jobItemId) {
+          setLibrary((current) => current.map((item) => {
+            if (item.id !== jobItemId) return item;
+            const hasPartialCues = Boolean(item.cues?.length || streamedTranslatedCues.length);
+            return {
+              ...item,
+              status: hasPartialCues ? 'partial' : 'failed',
+              progress: hasPartialCues ? item.progress : 0,
+              stage: hasPartialCues ? '后台生成中断' : '生成失败',
+              error: error.message,
+              cues: streamedTranslatedCues.length ? streamedTranslatedCues : item.cues,
+            };
+          }));
+        }
         if (recognitionRejected) {
           setProcessingStage('Speech recognition produced no usable text');
           setProcessingProgress(0.58);
@@ -1790,6 +1958,7 @@ export default function Home() {
         }
       }
     } finally {
+      if (transcriptionAbortRef.current === transcriptionController) transcriptionAbortRef.current = null;
       setTranslationRunning(false);
       setTranscribing(false);
       // Let the completed bar render briefly before it disappears.
@@ -1805,8 +1974,30 @@ export default function Home() {
     openPlayer();
   };
 
+  const closeConfig = () => {
+    if (processing || transcribing || translationRunning) return;
+    setViewStep('landing');
+    setStatusMessage('配置已关闭。视频仍保留在 Your library，可重新生成或删除。');
+  };
+
   const cancelProcessing = () => {
     processingCancelRef.current = true;
+    transcriptionAbortRef.current?.abort();
+    transcriptionAbortRef.current = null;
+    const cancelledJob = progressiveJob ? {
+      ...progressiveJob,
+      active: false,
+      cancelled: true,
+      stage: '后台生成已停止',
+    } : null;
+    setProgressiveJob(cancelledJob);
+    if (activeItemIdRef.current) {
+      updateLibraryItem(activeItemIdRef.current, {
+        status: cancelledJob?.processedThrough ? 'partial' : 'new',
+        stage: cancelledJob?.processedThrough ? '后台生成已停止' : '',
+        progressiveJob: cancelledJob,
+      });
+    }
     setProcessing(false);
     setTranscribing(false);
     setTranslationRunning(false);
@@ -1967,10 +2158,49 @@ export default function Home() {
   };
 
   const mediaDuration = duration || cues[cues.length - 1]?.end || 0;
+  const progressiveIncomplete = Boolean(
+    progressiveJob?.isLong
+    && progressiveJob.processedThrough > 0
+    && progressiveJob.processedThrough < (progressiveJob.duration || mediaDuration),
+  );
+  const playableThrough = progressiveIncomplete
+    ? Math.min(mediaDuration || progressiveJob.processedThrough, progressiveJob.processedThrough)
+    : mediaDuration;
+
+  useEffect(() => {
+    if (progressNoticeTimerRef.current) window.clearTimeout(progressNoticeTimerRef.current);
+    if (!progressiveIncomplete) {
+      setProgressNoticeVisible(true);
+      return undefined;
+    }
+
+    setProgressNoticeVisible(true);
+    progressNoticeTimerRef.current = window.setTimeout(
+      () => setProgressNoticeVisible(false),
+      PROGRESS_NOTICE_AUTO_HIDE_MS,
+    );
+    return () => {
+      if (progressNoticeTimerRef.current) window.clearTimeout(progressNoticeTimerRef.current);
+    };
+  }, [progressiveIncomplete]);
+
+  const hideProgressNotice = () => {
+    if (progressNoticeTimerRef.current) window.clearTimeout(progressNoticeTimerRef.current);
+    setProgressNoticeVisible(false);
+  };
+
+  const showProgressNotice = () => {
+    if (progressNoticeTimerRef.current) window.clearTimeout(progressNoticeTimerRef.current);
+    setProgressNoticeVisible(true);
+    progressNoticeTimerRef.current = window.setTimeout(
+      () => setProgressNoticeVisible(false),
+      PROGRESS_NOTICE_AUTO_HIDE_MS,
+    );
+  };
   const positionKey = mediaName ? `${mediaName}:${mediaFileRef.current?.size || 0}` : null;
 
   const syncVideoTime = (time) => {
-    const clamped = clamp(time, 0, mediaDuration || time);
+    const clamped = clamp(time, 0, playableThrough || mediaDuration || time);
     if (videoRef.current) videoRef.current.currentTime = clamped;
     setPlaybackTime(clamped);
   };
@@ -2110,7 +2340,17 @@ export default function Home() {
   // Translate an explicit list of cues and return the translated array. Shared
   // by the "Batch translate" button and the transcribe->translate pipeline so
   // both use identical batching/fallback behaviour.
-  const translateList = async (list, effectiveSource, target, onProgress, shouldCancel = () => false) => {
+  const translateList = async (
+    list,
+    effectiveSource,
+    target,
+    onProgress,
+    shouldCancel = () => false,
+    options = {},
+  ) => {
+    const maxAttempts = Math.max(1, Number(options.maxAttempts) || TRANSLATION_MAX_ATTEMPTS);
+    const timeoutMs = Math.max(5000, Number(options.timeoutMs) || TRANSLATION_TIMEOUT_MS);
+    const recoverFailures = options.recoverFailures !== false;
     const translateOne = async (cue) => {
       const translationContext = {
         cueId: cue.id,
@@ -2121,19 +2361,20 @@ export default function Home() {
       let lastFailure = 'Translation failed for an unknown reason.';
       let retryAfterMs = 0;
 
-      for (let attempt = 1; attempt <= TRANSLATION_MAX_ATTEMPTS; attempt += 1) {
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        if (shouldCancel()) return cue;
         const controller = new AbortController();
         const timeout = window.setTimeout(
-          () => controller.abort(`Translation timed out after ${TRANSLATION_TIMEOUT_MS / 1000} seconds.`),
-          TRANSLATION_TIMEOUT_MS,
+          () => controller.abort(`Translation timed out after ${timeoutMs / 1000} seconds.`),
+          timeoutMs,
         );
 
         try {
           console.log('[Translation] Request started', {
             ...translationContext,
             attempt,
-            maxAttempts: TRANSLATION_MAX_ATTEMPTS,
-            timeoutMs: TRANSLATION_TIMEOUT_MS,
+            maxAttempts,
+            timeoutMs,
           });
           const response = await fetch('/api/translate', {
             method: 'POST',
@@ -2203,7 +2444,7 @@ export default function Home() {
         } catch (error) {
           const aborted = controller.signal.aborted;
           lastFailure = aborted
-            ? `Translation timed out after ${TRANSLATION_TIMEOUT_MS / 1000} seconds.`
+            ? `Translation timed out after ${timeoutMs / 1000} seconds.`
             : (error instanceof Error ? error.message : String(error));
           console.warn('[Translation] Request exception; cue will be retried', {
             ...translationContext,
@@ -2215,7 +2456,7 @@ export default function Home() {
           window.clearTimeout(timeout);
         }
 
-        if (attempt < TRANSLATION_MAX_ATTEMPTS) {
+        if (attempt < maxAttempts) {
           console.warn('[Translation] Retrying failed cue', {
             ...translationContext,
             nextAttempt: attempt + 1,
@@ -2230,7 +2471,7 @@ export default function Home() {
 
       console.warn('[Translation] Cue still failed after this pass', {
         ...translationContext,
-        attempts: TRANSLATION_MAX_ATTEMPTS,
+        attempts: maxAttempts,
         error: lastFailure,
       });
       return {
@@ -2247,7 +2488,7 @@ export default function Home() {
     let nextIndex = 0;
     let completedCount = 0;
     const worker = async () => {
-      while (nextIndex < list.length) {
+      while (!shouldCancel() && nextIndex < list.length) {
         const index = nextIndex++;
         results[index] = await translateOne(list[index]);
         completedCount += 1;
@@ -2263,7 +2504,7 @@ export default function Home() {
       if (cue?.translationError) indexes.push(index);
       return indexes;
     }, []);
-    if (initiallyFailedIndexes.length && !shouldCancel()) {
+    if (recoverFailures && initiallyFailedIndexes.length && !shouldCancel()) {
       console.warn('[Translation] Retrying failed cues sequentially', {
         failed: initiallyFailedIndexes.length,
         total: results.length,
@@ -2427,7 +2668,7 @@ export default function Home() {
   };
 
   return (
-    <main className={`app-shell ${mode} step-${viewStep} ${intent}-intent${focusView ? ' focus-view' : ''}${settingsOpen ? ' settings-open' : ''}${viewStep === 'player' && isPlaying && !controlsVisible ? ' controls-hidden' : ' controls-active'}`}>
+    <main className={`app-shell ${mode} step-${viewStep} ${intent}-intent${focusView ? ' focus-view' : ''}${settingsOpen ? ' settings-open' : ''}${viewStep === 'player' && isPlaying && !controlsVisible ? ' controls-hidden' : ' controls-active'}${progressiveIncomplete && progressNoticeVisible ? ' progress-notice-visible' : ''}`}>
       <header className="topbar">
         <div className="brand">
           <IconButton label="Open your video library" icon={Menu} onClick={() => setLibraryOpen(true)} />
@@ -2459,6 +2700,17 @@ export default function Home() {
               {processingKind === 'full' && activeEngine ? ' · local Whisper' : ''}
               {` · ${Math.round(processingProgress * 100)}%`}
             </p>
+            {processingKind === 'full' && progressiveJob?.isLong ? (
+              <div className="processing-long-note">
+                <strong>由于视频较长，将先生成约 2 分钟内容</strong>
+                <span>
+                  首段完成后即可开始观看（约整体进度 {Math.max(1, Math.ceil(
+                    ((progressiveJob.firstSegmentSeconds || PROGRESSIVE_FIRST_SEGMENT_SECONDS)
+                      / Math.max(1, progressiveJob.duration || duration)) * 100,
+                  ))}%），后续按 3 分钟一段继续在后台生成。
+                </span>
+              </div>
+            ) : null}
             {processingKind === 'translation' ? (
               <ol className="processing-steps">
                 <li className="done">Keep source text and timing</li>
@@ -2513,6 +2765,16 @@ export default function Home() {
       {viewStep === 'config' ? (
         <section className="config-flow" aria-label="Configure">
           <div className="config-card">
+            <button
+              type="button"
+              className="config-close-button"
+              aria-label="关闭生成配置"
+              title="关闭生成配置"
+              disabled={processing || transcribing || translationRunning}
+              onClick={closeConfig}
+            >
+              <X size={18} />
+            </button>
             <div className="config-media-line">
               <Film size={18} />
               <span>{mediaName}</span>
@@ -2611,28 +2873,64 @@ export default function Home() {
         <section className="stage-column" aria-label="Player and configuration">
           <div className="player-shell" onPointerMove={revealPlayerChrome} onFocusCapture={revealPlayerChrome}>
             <div className="player-topline">
-              <div>
-                <strong>{mediaName}</strong>
-                <span>{sourceLangLabel(detectedLang || sourceLang)} → {languageLabel(targetLang)}</span>
+              <div className="player-topline-main">
+                <div>
+                  <strong>{mediaName}</strong>
+                  <span>{sourceLangLabel(detectedLang || sourceLang)} → {languageLabel(targetLang)}</span>
+                </div>
+                <div className="player-tools">
+                  {progressiveIncomplete && !progressNoticeVisible ? (
+                    <IconButton
+                      label={`显示后台生成进度：已生成至 ${clockShort(progressiveJob.processedThrough)}，${progressiveJob.percent}%`}
+                      icon={Clock}
+                      active
+                      className="progressive-status-toggle"
+                      onClick={showProgressNotice}
+                    />
+                  ) : null}
+                  <IconButton label="Your video library" icon={Menu} onClick={() => setLibraryOpen(true)} />
+                  <IconButton
+                    label={translationRunning ? 'Translating subtitles' : 'Re-translate the subtitles'}
+                    icon={Languages}
+                    active={!translationDone || translationRunning}
+                    disabled={!cues.length || translationRunning || transcribing || processing}
+                    onClick={() => translateCues()}
+                  />
+                  <IconButton
+                    label={subtitleLog ? `Download session subtitle log (${subtitleLog.cueCount} cues)` : 'No session subtitle log yet'}
+                    icon={Download}
+                    disabled={!subtitleLog}
+                    onClick={downloadSubtitleLog}
+                  />
+                  <IconButton label="Subtitle style & position" icon={SlidersHorizontal} onClick={() => openSettings('subtitles')} />
+                  <IconButton label="Settings" icon={Settings} onClick={() => openSettings('languages')} />
+                </div>
               </div>
-              <div className="player-tools">
-                <IconButton label="Your video library" icon={Menu} onClick={() => setLibraryOpen(true)} />
-                <IconButton
-                  label={translationRunning ? 'Translating subtitles' : 'Re-translate the subtitles'}
-                  icon={Languages}
-                  active={!translationDone || translationRunning}
-                  disabled={!cues.length || translationRunning || transcribing || processing}
-                  onClick={() => translateCues()}
-                />
-                <IconButton
-                  label={subtitleLog ? `Download session subtitle log (${subtitleLog.cueCount} cues)` : 'No session subtitle log yet'}
-                  icon={Download}
-                  disabled={!subtitleLog}
-                  onClick={downloadSubtitleLog}
-                />
-                <IconButton label="Subtitle style & position" icon={SlidersHorizontal} onClick={() => openSettings('subtitles')} />
-                <IconButton label="Settings" icon={Settings} onClick={() => openSettings('languages')} />
-              </div>
+              {progressiveIncomplete && progressNoticeVisible ? (
+                <div className="progressive-playback-status" role="status" aria-live="polite">
+                  <span>
+                    {progressiveJob.active
+                      ? `已生成至 ${clockShort(progressiveJob.processedThrough)}，可以边看边等；${progressiveJob.stage}`
+                      : `后台生成已停止，当前可播放到 ${clockShort(progressiveJob.processedThrough)}`}
+                  </span>
+                  <div>
+                    <strong>{progressiveJob.percent}%</strong>
+                    {progressiveJob.active ? (
+                      <IconButton
+                        label="停止后台生成"
+                        icon={Pause}
+                        onClick={cancelProcessing}
+                      />
+                    ) : null}
+                    <IconButton
+                      label="隐藏生成进度提示"
+                      icon={X}
+                      className="progress-notice-hide"
+                      onClick={hideProgressNotice}
+                    />
+                  </div>
+                </div>
+              ) : null}
             </div>
 
             <div ref={videoFrameRef} className="video-frame">
@@ -2655,6 +2953,12 @@ export default function Home() {
                   }}
                   onTimeUpdate={(event) => {
                     const video = event.currentTarget;
+                    if (progressiveIncomplete && playableThrough > 0 && video.currentTime >= playableThrough) {
+                      video.pause();
+                      video.currentTime = Math.max(0, playableThrough - 0.1);
+                      setIsPlaying(false);
+                      setStatusMessage(`已播放到当前生成位置 ${clockShort(playableThrough)}，后续字幕仍在后台生成。`);
+                    }
                     setPlaybackTime(video.currentTime);
                     // Remember the position every few seconds while playing.
                     if (Math.abs(video.currentTime - positionSaveRef.current) > 3) {
@@ -2669,10 +2973,21 @@ export default function Home() {
                       setStatusMessage('Playback stays paused until transcription and translation are complete.');
                       return;
                     }
+                    if (progressiveIncomplete && playableThrough > 0 && event.currentTarget.currentTime >= playableThrough - 0.1) {
+                      event.currentTarget.pause();
+                      setIsPlaying(false);
+                      setStatusMessage(`后续内容仍在生成中，目前可播放到 ${clockShort(playableThrough)}。`);
+                      return;
+                    }
                     setPlaybackTime(event.currentTarget.currentTime);
                     setIsPlaying(true);
                   }}
-                  onSeeking={(event) => setPlaybackTime(event.currentTarget.currentTime)}
+                  onSeeking={(event) => {
+                    if (progressiveIncomplete && playableThrough > 0 && event.currentTarget.currentTime > playableThrough) {
+                      event.currentTarget.currentTime = Math.max(0, playableThrough - 0.1);
+                    }
+                    setPlaybackTime(event.currentTarget.currentTime);
+                  }}
                   onSeeked={(event) => setPlaybackTime(event.currentTarget.currentTime)}
                   onPause={(event) => {
                     setIsPlaying(false);
@@ -2755,6 +3070,13 @@ export default function Home() {
                   if (event.key === 'ArrowLeft') { event.preventDefault(); seekBy(-5); }
                 }}
               >
+                {progressiveIncomplete && mediaDuration ? (
+                  <span
+                    className="generated-range"
+                    style={{ width: `${Math.min(100, (playableThrough / mediaDuration) * 100)}%` }}
+                    aria-hidden="true"
+                  />
+                ) : null}
                 <div style={{ width: `${mediaDuration ? Math.min(100, (playbackTime / mediaDuration) * 100) : 0}%` }} />
                 <span className="seek-handle" style={{ left: `${mediaDuration ? Math.min(100, (playbackTime / mediaDuration) * 100) : 0}%` }} aria-hidden="true" />
               </div>
@@ -2986,6 +3308,10 @@ export default function Home() {
                     <button
                       type="button"
                       className={`library-item ${item.status}${item.id === activeItemId ? ' active' : ''}`}
+                      disabled={transcribing && item.id !== activeItemId}
+                      title={transcribing && item.id !== activeItemId
+                        ? '当前长视频仍在后台生成字幕，完成或停止后可切换视频'
+                        : `Open ${item.name}`}
                       onClick={() => { selectLibraryItem(item); setLibraryOpen(false); }}
                     >
                       <Film size={16} />
@@ -2993,6 +3319,7 @@ export default function Home() {
                       <small>
                         {item.status === 'processing' ? `${item.progress}% · ${item.stage}`
                           : item.status === 'done' ? 'Subtitles ready — click to watch'
+                            : item.status === 'partial' ? `已生成至 ${clockShort(item.progressiveJob?.processedThrough || 0)} — 可继续观看`
                             : item.status === 'failed' ? `Failed: ${item.error}`
                               : 'Waiting — no subtitles yet'}
                       </small>

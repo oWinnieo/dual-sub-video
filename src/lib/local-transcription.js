@@ -4,6 +4,11 @@ import { createRequire } from 'module';
 import os from 'os';
 import path from 'path';
 import { env, pipeline } from '@xenova/transformers';
+import {
+  buildLanguageTokenProbeConfig,
+  languageTokenCandidatesFromBeams,
+  summarizeLanguageTokenSamples,
+} from './whisper-language-detection.js';
 
 const require = createRequire(import.meta.url);
 const DEFAULT_HOME = path.join(os.homedir(), '.lingoloop');
@@ -20,6 +25,7 @@ const GAP_CONTEXT_SECONDS = 0.75;
 const MAX_GAP_RECOVERY_SECONDS = 28;
 const MAX_GAP_RECOVERY_ATTEMPTS = 16;
 const MODEL_LOAD_MAX_ATTEMPTS = 2;
+const SEGMENT_CONTEXT_SECONDS = 8;
 
 const QUALITY_MODELS = {
   fast: { id: 'Xenova/whisper-tiny', label: 'Tiny' },
@@ -593,7 +599,12 @@ function recognitionOptions(language) {
   return options;
 }
 
-async function recognizeSamples(plan, samples, { model, language, logStage = 'recognize' }) {
+async function recognizeSamples(plan, samples, {
+  model,
+  language,
+  logStage = 'recognize',
+  onWindowProgress,
+}) {
   const durationSeconds = samples.length / SAMPLE_RATE;
   const recognizer = await getRecognizer(model, lingoloopPaths().modelCacheDir, plan.logPath);
   const windows = audioWindows(samples);
@@ -704,6 +715,7 @@ async function recognizeSamples(plan, samples, { model, language, logStage = 're
       rawCueCount: rawWindowCues.length,
       cueCount: windowCues.length,
     });
+    onWindowProgress?.({ index: index + 1, total: windows.length });
   }
   const stitchedCues = stitchWindowCues(cues, durationSeconds);
   const durationMs = Date.now() - startedAt;
@@ -732,15 +744,66 @@ function representativeSampleRanges(durationSeconds) {
     .map((start) => ({ start, end: Math.min(durationSeconds, start + DETECTION_SAMPLE_SECONDS) }));
 }
 
-async function detectSpokenLanguage(plan, samples) {
+async function extractRepresentativeDetectionSamples(plan, mediaPath, durationSeconds) {
+  const ranges = representativeSampleRanges(durationSeconds);
+  const sampleChunks = [];
+  let totalSamples = 0;
+
+  appendJobLog(plan.logPath, {
+    stage: 'language-detection',
+    event: 'whole-media-fallback-start',
+    ranges,
+  });
+  for (let index = 0; index < ranges.length; index += 1) {
+    const range = ranges[index];
+    const wavPath = path.join(plan.outputDir, `language-sample-${index + 1}.wav`);
+    await runCommand({
+      bin: plan.commands.extractAudio.bin,
+      args: [
+        '-nostdin',
+        '-ss', String(range.start),
+        '-t', String(Math.max(0.1, range.end - range.start)),
+        '-i', mediaPath,
+        '-vn',
+        '-ac', '1',
+        '-ar', String(SAMPLE_RATE),
+        '-c:a', 'pcm_s16le',
+        '-f', 'wav',
+        wavPath,
+      ],
+    }, `ffmpeg-language-sample-${index + 1}`, plan.logPath);
+    const samples = readPcm16MonoWav(wavPath);
+    sampleChunks.push(samples);
+    totalSamples += samples.length;
+  }
+
+  const combined = new Float32Array(totalSamples);
+  let offset = 0;
+  for (const samples of sampleChunks) {
+    combined.set(samples, offset);
+    offset += samples.length;
+  }
+  appendJobLog(plan.logPath, {
+    stage: 'language-detection',
+    event: 'whole-media-fallback-ready',
+    durationSeconds: combined.length / SAMPLE_RATE,
+    sampleCount: ranges.length,
+  });
+  return combined;
+}
+
+async function detectSpokenLanguage(plan, samples, rangesOverride = null) {
   const durationSeconds = samples.length / SAMPLE_RATE;
   const recognizer = await getRecognizer(plan.model, lingoloopPaths().modelCacheDir, plan.logPath);
-  const ranges = representativeSampleRanges(durationSeconds);
-  const languageEvidenceCues = [];
+  const ranges = rangesOverride || representativeSampleRanges(durationSeconds);
+  const tokenSamples = [];
+  const generationConfig = recognizer?.model?.generation_config || {};
+  const probeConfig = buildLanguageTokenProbeConfig(generationConfig);
   appendJobLog(plan.logPath, {
     stage: 'language-detection',
     event: 'start',
     model: plan.model.id,
+    method: 'whisper-language-token',
     ranges,
   });
 
@@ -749,29 +812,29 @@ async function detectSpokenLanguage(plan, samples) {
     const startSample = Math.floor(range.start * SAMPLE_RATE);
     const endSample = Math.min(samples.length, Math.ceil(range.end * SAMPLE_RATE));
     const sample = samples.subarray(startSample, endSample);
-    const output = await recognizer(sample, { ...recognitionOptions('auto') });
-    const modelCues = transformerOutputToCues(output, sample.length / SAMPLE_RATE);
-    const assessment = assessWhisperCues(modelCues);
-    languageEvidenceCues.push(...assessment.accepted);
-    // Repetitive garbage is unusable as subtitle text, but a short capped
-    // fragment such as "チチチ…" still provides a useful Japanese-script hint.
-    // Pure sound markers remain excluded so repeated "(笑)" samples cannot be
-    // mistaken for Chinese.
-    languageEvidenceCues.push(...assessment.rejected
-      .filter(({ reason }) => reason !== 'the cue contains only a non-speech sound marker')
-      .map(({ cue }) => ({ ...cue, original: Array.from(cue.original).slice(0, 12).join('') })));
+    const processed = await recognizer.processor(sample);
+    let latestBeams = [];
+    await recognizer.model.generate(processed.input_features, {
+      ...probeConfig,
+      callback_function: (beams) => {
+        latestBeams = beams;
+      },
+    });
+    const candidates = languageTokenCandidatesFromBeams(
+      latestBeams,
+      generationConfig.lang_to_id,
+    );
+    tokenSamples.push({ range, candidates });
     appendJobLog(plan.logPath, {
       stage: 'language-detection',
       event: 'sample-complete',
       index: index + 1,
       range,
-      accepted: assessment.accepted.length,
-      rejected: assessment.rejected.length,
-      preview: assessment.accepted.map((cue) => cue.original).join(' ').slice(0, 240),
+      candidates: candidates.slice(0, 5),
     });
   }
 
-  const result = scriptLanguageEvidence(languageEvidenceCues);
+  const result = summarizeLanguageTokenSamples(tokenSamples);
   appendJobLog(plan.logPath, {
     stage: 'language-detection',
     event: 'complete',
@@ -923,8 +986,10 @@ export async function runWhisperJob(jobSpec) {
     });
 
     const probe = await runCommand(plan.commands.probe, 'ffprobe', plan.logPath);
+    let mediaDurationSeconds = 0;
     try {
       const probeData = JSON.parse(probe.stdout);
+      mediaDurationSeconds = Number(probeData?.format?.duration) || 0;
       appendJobLog(plan.logPath, {
         stage: 'ffprobe',
         event: 'media-summary',
@@ -950,6 +1015,20 @@ export async function runWhisperJob(jobSpec) {
     }
     stages.push({ id: 'ffprobe', label: 'Probe media', durationMs: probe.durationMs });
 
+    const segmentSeconds = Math.max(0, Number(jobSpec.segmentSeconds) || 0);
+    if (segmentSeconds > 0 && mediaDurationSeconds > 0) {
+      return await runSegmentedWhisperJob(plan, {
+        mediaPath: jobSpec.mediaPath,
+        durationSeconds: mediaDurationSeconds,
+        segmentSeconds,
+        firstSegmentSeconds: Math.max(0, Number(jobSpec.firstSegmentSeconds) || segmentSeconds),
+        onProgress: jobSpec.onProgress,
+        onSegment: jobSpec.onSegment,
+        signal: jobSpec.signal,
+        stages,
+      });
+    }
+
     const audio = await runCommand(plan.commands.extractAudio, 'ffmpeg', plan.logPath);
     stages.push({ id: 'ffmpeg', label: 'Extract mono 16 kHz audio', durationMs: audio.durationMs });
 
@@ -963,6 +1042,12 @@ export async function runWhisperJob(jobSpec) {
     if (plan.language === 'auto') {
       languageDetection = await detectSpokenLanguage(plan, samples);
       detectedLanguage = languageDetection.language;
+      if (!detectedLanguage) {
+        throw stageFailure(
+          'language-detection',
+          `Auto-detect could not identify the spoken language confidently (${Math.round((languageDetection.confidence || 0) * 100)}%). Choose the spoken language explicitly and regenerate the subtitles.`,
+        );
+      }
       if (detectedLanguage) {
         const bestStatus = getWhisperStatus('best');
         if (!bestStatus.ready) {
@@ -1045,6 +1130,215 @@ export async function runWhisperJob(jobSpec) {
     }
     cleanupStaleJobDirs(plan.outputDir);
   }
+}
+
+async function runSegmentedWhisperJob(plan, {
+  mediaPath,
+  durationSeconds,
+  segmentSeconds,
+  firstSegmentSeconds,
+  onProgress,
+  onSegment,
+  signal,
+  stages,
+}) {
+  const initialEnd = Math.min(durationSeconds, firstSegmentSeconds || segmentSeconds);
+  const segmentRanges = [{ start: 0, end: initialEnd }];
+  for (let start = initialEnd; start < durationSeconds; start += segmentSeconds) {
+    segmentRanges.push({ start, end: Math.min(durationSeconds, start + segmentSeconds) });
+  }
+  const totalSegments = segmentRanges.length;
+  const allCues = [];
+  let detectedLanguage = plan.language === 'auto' ? null : plan.language;
+  let languageDetection = null;
+  let effectiveQuality = plan.quality;
+  let effectiveModel = plan.model;
+  let autoUpgraded = false;
+  let recoveredCueCount = 0;
+  let attemptedGapRecoveries = 0;
+  let rejectedHallucinations = 0;
+
+  appendJobLog(plan.logPath, {
+    event: 'segmented-job-start',
+    durationSeconds,
+    segmentSeconds,
+    firstSegmentSeconds: initialEnd,
+    totalSegments,
+  });
+
+  for (let index = 0; index < totalSegments; index += 1) {
+    if (signal?.aborted) {
+      const error = stageFailure('cancelled', 'Transcription was cancelled.');
+      error.code = 'TRANSCRIPTION_CANCELLED';
+      throw error;
+    }
+    const { start, end } = segmentRanges[index];
+    const contextStart = Math.max(0, start - SEGMENT_CONTEXT_SECONDS);
+    const contextEnd = Math.min(durationSeconds, end + SEGMENT_CONTEXT_SECONDS);
+    const chunkDuration = contextEnd - contextStart;
+    const wavPath = path.join(plan.outputDir, `audio-${String(index + 1).padStart(3, '0')}.wav`);
+    const extractCommand = {
+      bin: plan.commands.extractAudio.bin,
+      args: [
+        '-nostdin',
+        '-ss', String(contextStart),
+        '-t', String(chunkDuration),
+        '-i', mediaPath,
+        '-vn',
+        '-ac', '1',
+        '-ar', String(SAMPLE_RATE),
+        '-c:a', 'pcm_s16le',
+        '-f', 'wav',
+        wavPath,
+      ],
+    };
+
+    onProgress?.({
+      type: 'segment-start',
+      index,
+      totalSegments,
+      start,
+      end,
+      contextStart,
+      contextEnd,
+      durationSeconds,
+      firstSegmentSeconds: initialEnd,
+    });
+    const audio = await runCommand(extractCommand, `ffmpeg-segment-${index + 1}`, plan.logPath);
+    const samples = readPcm16MonoWav(wavPath);
+
+    if (index === 0 && plan.language === 'auto') {
+      languageDetection = await detectSpokenLanguage(plan, samples);
+      detectedLanguage = languageDetection.language;
+      if (!detectedLanguage && durationSeconds > chunkDuration) {
+        const representativeSamples = await extractRepresentativeDetectionSamples(
+          plan,
+          mediaPath,
+          durationSeconds,
+        );
+        languageDetection = await detectSpokenLanguage(
+          plan,
+          representativeSamples,
+          representativeSampleRanges(durationSeconds).map((_, sampleIndex) => ({
+            start: sampleIndex * DETECTION_SAMPLE_SECONDS,
+            end: (sampleIndex + 1) * DETECTION_SAMPLE_SECONDS,
+          })),
+        );
+        detectedLanguage = languageDetection.language;
+      }
+      if (!detectedLanguage) {
+        throw stageFailure(
+          'language-detection',
+          `Auto-detect could not identify the spoken language confidently (${Math.round((languageDetection.confidence || 0) * 100)}%). Choose the spoken language explicitly and regenerate the subtitles.`,
+        );
+      }
+      const bestStatus = getWhisperStatus('best');
+      if (!bestStatus.ready) {
+        throw stageFailure('preflight', `Smart Auto detected ${detectedLanguage}, but the Best transcription model is unavailable.`);
+      }
+      effectiveQuality = 'best';
+      effectiveModel = modelForQuality('best');
+      autoUpgraded = plan.quality !== 'best';
+    }
+
+    const recognized = await recognizeSamples(plan, samples, {
+      model: effectiveModel,
+      language: detectedLanguage || plan.language,
+      logStage: `recognize-segment-${index + 1}`,
+      onWindowProgress: ({ index: windowIndex, total: totalWindows }) => onProgress?.({
+        type: 'segment-progress',
+        index,
+        totalSegments,
+        windowIndex,
+        totalWindows,
+        start,
+        end,
+        contextStart,
+        contextEnd,
+        durationSeconds,
+        firstSegmentSeconds: initialEnd,
+      }),
+    });
+    const recovered = await recoverSpeechGaps(plan, samples, recognized.cues, {
+      model: effectiveModel,
+      language: detectedLanguage || plan.language,
+    });
+    const segmentCues = recovered.cues
+      .map((cue, cueIndex) => ({
+        ...cue,
+        id: `node-whisper-segment-${index + 1}-${cueIndex + 1}`,
+        start: cue.start + contextStart,
+        end: Math.min(durationSeconds, cue.end + contextStart),
+      }))
+      .filter((cue) => {
+        const midpoint = cue.start + ((cue.end - cue.start) / 2);
+        return midpoint >= start
+          && (index === totalSegments - 1 ? midpoint <= end : midpoint < end);
+      });
+
+    allCues.push(...segmentCues);
+    recoveredCueCount += recovered.recoveredCueCount;
+    attemptedGapRecoveries += recovered.attemptedGaps;
+    rejectedHallucinations += recognized.rejectedHallucinations;
+    stages.push({
+      id: `segment-${index + 1}`,
+      label: `Process segment ${index + 1} of ${totalSegments}`,
+      durationMs: audio.durationMs + recognized.durationMs + recovered.durationMs,
+      count: segmentCues.length,
+    });
+
+    const segmentResult = {
+      index,
+      totalSegments,
+      start,
+      end,
+      contextStart,
+      contextEnd,
+      contextSeconds: SEGMENT_CONTEXT_SECONDS,
+      durationSeconds,
+      firstSegmentSeconds: initialEnd,
+      cues: segmentCues,
+      detectedLanguage,
+      effectiveQuality,
+      autoUpgraded,
+      languageDetection,
+      recoveredCueCount: recovered.recoveredCueCount,
+      attemptedGapRecoveries: recovered.attemptedGaps,
+      rejectedHallucinations: recognized.rejectedHallucinations,
+    };
+    await onSegment?.(segmentResult);
+    onProgress?.({ type: 'segment-complete', ...segmentResult, cues: undefined });
+    try {
+      fs.rmSync(wavPath, { force: true });
+    } catch {
+      // The job-level cleanup below remains the final safety net.
+    }
+  }
+
+  const cues = stitchWindowCues(allCues, durationSeconds);
+  appendJobLog(plan.logPath, {
+    event: 'segmented-job-complete',
+    cueCount: cues.length,
+    totalSegments,
+    detectedLanguage,
+    effectiveQuality,
+  });
+  return {
+    cues,
+    detectedLanguage,
+    effectiveQuality,
+    autoUpgraded,
+    languageDetection,
+    recoveredCueCount,
+    attemptedGapRecoveries,
+    rejectedHallucinations,
+    plan,
+    stages,
+    durationSeconds,
+    segmentSeconds,
+    firstSegmentSeconds: initialEnd,
+    totalSegments,
+  };
 }
 
 // Sweep any temp job dirs older than a day that a crashed run left behind.

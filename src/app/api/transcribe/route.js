@@ -1,8 +1,10 @@
 import { NextResponse } from 'next/server';
 import { randomUUID } from 'crypto';
-import { promises as fs } from 'fs';
+import { createWriteStream, promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
+import { Readable } from 'stream';
+import { pipeline } from 'stream/promises';
 import { runWhisperJob, getWhisperStatus, lingoloopPaths } from '@/lib/local-transcription';
 
 // This route uses bundled FFmpeg plus the Node-side Whisper model, so it must
@@ -11,6 +13,8 @@ export const runtime = 'nodejs';
 export const maxDuration = 600;
 
 const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
+const STREAM_FIRST_SEGMENT_SECONDS = 2 * 60;
+const STREAM_SEGMENT_SECONDS = 3 * 60;
 
 // GET -> pipeline health (used by the UI's "Repair transcription" check).
 export async function GET(request) {
@@ -32,7 +36,7 @@ async function writeUploadToTemp(file) {
   }
   const dir = await fs.mkdtemp(path.join(root, 'upload-'));
   const dest = path.join(dir, sanitizeName(file.name));
-  await fs.writeFile(dest, Buffer.from(await file.arrayBuffer()));
+  await pipeline(Readable.fromWeb(file.stream()), createWriteStream(dest));
   return { dir, dest };
 }
 
@@ -46,6 +50,85 @@ function resolveSamplePath(samplePath) {
     throw new Error('Sample path must stay inside public/samples.');
   }
   return resolved;
+}
+
+function streamTranscription({ mediaPath, language, quality, job, status, cleanupDir, signal }) {
+  const encoder = new TextEncoder();
+  const send = (controller, event) => {
+    if (signal?.aborted) return false;
+    try {
+      controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const stream = new ReadableStream({
+    start(controller) {
+      void (async () => {
+        try {
+          const result = await runWhisperJob({
+            mediaPath,
+            language,
+            quality,
+            jobId: job.id,
+            segmentSeconds: STREAM_SEGMENT_SECONDS,
+            firstSegmentSeconds: STREAM_FIRST_SEGMENT_SECONDS,
+            signal,
+            onProgress: (progress) => send(controller, progress),
+            onSegment: (segment) => send(controller, { type: 'segment', ...segment }),
+          });
+          send(controller, {
+            type: 'complete',
+            cues: result.cues,
+            detectedLanguage: result.detectedLanguage,
+            effectiveQuality: result.effectiveQuality,
+            autoUpgraded: result.autoUpgraded,
+            languageDetection: result.languageDetection,
+            recoveredCueCount: result.recoveredCueCount,
+            attemptedGapRecoveries: result.attemptedGapRecoveries,
+            rejectedHallucinations: result.rejectedHallucinations,
+            durationSeconds: result.durationSeconds,
+            segmentSeconds: result.segmentSeconds,
+            firstSegmentSeconds: result.firstSegmentSeconds,
+            totalSegments: result.totalSegments,
+            engine: 'node-whisper',
+            status,
+            logPath: result.plan.logPath,
+            job: { ...job, stage: 'complete', logPath: result.plan.logPath, stages: result.stages },
+          });
+        } catch (error) {
+          send(controller, {
+            type: 'error',
+            error: error?.message || 'Transcription failed.',
+            code: error?.code || 'TRANSCRIPTION_FAILED',
+            job: {
+              ...job,
+              stage: error?.stage || job.stage,
+              logPath: error?.logPath || job.logPath,
+              id: error?.jobId || job.id,
+            },
+          });
+        } finally {
+          if (cleanupDir) await fs.rm(cleanupDir, { recursive: true, force: true }).catch(() => {});
+          try {
+            controller.close();
+          } catch {
+            // The browser may have cancelled the stream after a completed segment.
+          }
+        }
+      })();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'application/x-ndjson; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
 }
 
 export async function POST(request) {
@@ -65,6 +148,7 @@ export async function POST(request) {
     let mediaPath = null;
     let language = 'auto';
     let quality = 'fast';
+    let streamRequested = false;
 
     if (contentType.includes('multipart/form-data')) {
       // Browser path (next dev / web): the video is uploaded as a File.
@@ -75,6 +159,7 @@ export async function POST(request) {
       }
       language = form.get('language') || 'auto';
       quality = form.get('quality') || 'fast';
+      streamRequested = form.get('stream') === '1';
       job = {
         ...job,
         source: 'browser-upload',
@@ -90,6 +175,7 @@ export async function POST(request) {
       const body = await request.json().catch(() => ({}));
       language = body.language || 'auto';
       quality = body.quality || 'fast';
+      streamRequested = body.stream === true;
       if (body.path) {
         mediaPath = body.path;
         job = { ...job, source: 'desktop-path', fileName: path.basename(mediaPath), stage: 'validating-media' };
@@ -125,6 +211,19 @@ export async function POST(request) {
     }
 
     job = { ...job, stage: 'local-pipeline', logPath: path.join(status.paths.logsDir, `${jobId}.log`) };
+    if (streamRequested) {
+      const ownedCleanupDir = cleanupDir;
+      cleanupDir = null;
+      return streamTranscription({
+        mediaPath,
+        language,
+        quality,
+        job,
+        status,
+        cleanupDir: ownedCleanupDir,
+        signal: request.signal,
+      });
+    }
     const {
       cues,
       detectedLanguage,

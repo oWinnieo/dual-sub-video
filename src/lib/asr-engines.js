@@ -16,7 +16,62 @@
 // Send the imported media to the local Node-side Whisper backend. In Electron we use
 // the original desktop path; in a normal browser we upload the File as a
 // bridge to the same local route.
-async function transcribeWithLocalEngine(file, { language, quality, mediaPath, samplePath, onProgress }) {
+async function readStreamingTranscription(res, { onProgress, onSegment }) {
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error('The local transcription stream could not be opened.');
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let completed = null;
+
+  const handleLine = async (line) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line);
+    if (event.type === 'error') {
+      const error = new Error(event.error || 'Local transcription failed.');
+      error.code = event.code || null;
+      error.job = event.job || null;
+      throw error;
+    }
+    if (event.type === 'segment-start') {
+      const fraction = event.durationSeconds ? event.start / event.durationSeconds : 0;
+      onProgress?.(Math.min(0.99, fraction), `Extracting segment ${event.index + 1} of ${event.totalSegments}`, event);
+    } else if (event.type === 'segment-progress') {
+      const withinSegment = event.totalWindows ? event.windowIndex / event.totalWindows : 0;
+      const mediaTime = event.start + ((event.end - event.start) * withinSegment);
+      const fraction = event.durationSeconds ? mediaTime / event.durationSeconds : withinSegment;
+      onProgress?.(Math.min(0.99, fraction), `Transcribing segment ${event.index + 1} of ${event.totalSegments}`, event);
+    } else if (event.type === 'segment') {
+      await onSegment?.(event);
+      const fraction = event.durationSeconds ? event.end / event.durationSeconds : 1;
+      onProgress?.(Math.min(0.99, fraction), `Segment ${event.index + 1} of ${event.totalSegments} ready`, event);
+    } else if (event.type === 'complete') {
+      completed = event;
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) await handleLine(line);
+    if (done) break;
+  }
+  if (buffer.trim()) await handleLine(buffer);
+  if (!completed) throw new Error('The local transcription stream ended before completion.');
+  return completed;
+}
+
+async function transcribeWithLocalEngine(file, {
+  language,
+  quality,
+  mediaPath,
+  samplePath,
+  progressive,
+  signal,
+  onProgress,
+  onSegment,
+}) {
   const lang = language === 'detect' ? 'auto' : language;
   let request;
   console.log('[Transcription] Request started', {
@@ -27,29 +82,31 @@ async function transcribeWithLocalEngine(file, { language, quality, mediaPath, s
   });
 
   if (mediaPath || samplePath) {
-    onProgress?.(0.08, mediaPath ? 'Sending desktop path to local engine' : 'Running sample smoke test');
+    onProgress?.(progressive ? 0.01 : 0.08, mediaPath ? 'Sending desktop path to local engine' : 'Running sample smoke test');
     request = fetch('/api/transcribe', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: mediaPath, samplePath, language: lang, quality }),
+      body: JSON.stringify({ path: mediaPath, samplePath, language: lang, quality, stream: progressive }),
+      signal,
     });
   } else if (file) {
-    onProgress?.(0.08, 'Uploading audio to local engine');
+    onProgress?.(progressive ? 0.01 : 0.08, 'Uploading audio to local engine');
     const form = new FormData();
     form.append('file', file);
     form.append('language', lang);
     form.append('quality', quality);
-    request = fetch('/api/transcribe', { method: 'POST', body: form });
+    if (progressive) form.append('stream', '1');
+    request = fetch('/api/transcribe', { method: 'POST', body: form, signal });
   } else {
     throw new Error('No media file or sample path was provided for local transcription.');
   }
 
   // The server can't stream progress for a single local recognition run, so tick a
   // soft heartbeat while we wait — otherwise long jobs look frozen.
-  let heartbeat = 0.1;
+  let heartbeat = progressive ? 0.01 : 0.1;
   const ticker = setInterval(() => {
-    heartbeat = Math.min(0.8, heartbeat + 0.02);
-    onProgress?.(heartbeat, 'Transcribing with local Whisper');
+    heartbeat = Math.min(progressive ? 0.02 : 0.8, heartbeat + (progressive ? 0.002 : 0.02));
+    onProgress?.(heartbeat, progressive ? 'Uploading media to local engine' : 'Transcribing with local Whisper');
   }, 2000);
 
   let res;
@@ -74,8 +131,10 @@ async function transcribeWithLocalEngine(file, { language, quality, mediaPath, s
     err.statusInfo = data.status || null;
     throw err;
   }
-  onProgress?.(0.85, 'Reading cues');
-  const data = await res.json();
+  if (!progressive) onProgress?.(0.85, 'Reading cues');
+  const data = progressive
+    ? await readStreamingTranscription(res, { onProgress, onSegment })
+    : await res.json();
   console.log('[Transcription] Completed', {
     detectedLanguage: data.detectedLanguage || null,
     effectiveQuality: data.effectiveQuality || quality,
@@ -106,8 +165,9 @@ async function transcribeWithLocalEngine(file, { language, quality, mediaPath, s
  *
  * @param {File|null} file
  * @param {{engine?:string, language?:string, quality?:string,
- *          mediaPath?:string, samplePath?:string,
+ *          mediaPath?:string, samplePath?:string, progressive?:boolean, signal?:AbortSignal,
  *          onProgress?:(fraction:number, stage:string)=>void,
+ *          onSegment?:(segment:object)=>void|Promise<void>,
  *          onEngine?:(engineId:string)=>void}} options
  */
 export async function transcribeVideo(file, options = {}) {
@@ -117,7 +177,10 @@ export async function transcribeVideo(file, options = {}) {
     quality = 'balanced',
     mediaPath = '',
     samplePath = '',
+    progressive = false,
+    signal,
     onProgress,
+    onSegment,
     onEngine,
   } = options;
 
@@ -128,5 +191,14 @@ export async function transcribeVideo(file, options = {}) {
   }
 
   onEngine?.('node-whisper');
-  return transcribeWithLocalEngine(file, { language, quality, mediaPath, samplePath, onProgress });
+  return transcribeWithLocalEngine(file, {
+    language,
+    quality,
+    mediaPath,
+    samplePath,
+    progressive,
+    signal,
+    onProgress,
+    onSegment,
+  });
 }

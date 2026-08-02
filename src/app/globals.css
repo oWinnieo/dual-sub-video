@@ -460,6 +460,7 @@ select:focus-visible {
 }
 
 .config-card {
+  position: relative;
   width: min(520px, 100%);
   display: grid;
   gap: 14px;
@@ -470,12 +471,31 @@ select:focus-visible {
   box-shadow: var(--shadow);
 }
 
+.config-close-button {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  color: var(--muted);
+  background: var(--tint-2);
+}
+
+.config-close-button:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--line-strong);
+}
+
 .config-media-line {
   display: grid;
   grid-template-columns: auto 1fr auto;
   align-items: center;
   gap: 9px;
   min-width: 0;
+  padding-right: 40px;
 }
 
 .config-media-line svg {
@@ -883,7 +903,20 @@ select:focus-visible {
 }
 
 .player-topline {
+  align-items: stretch;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
   border-bottom: 1px solid var(--line);
+}
+
+.player-topline-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
 }
 
 .step-player .player-topline,
@@ -913,6 +946,12 @@ select:focus-visible {
   opacity: 0;
   pointer-events: none;
   transform: translateY(-8px);
+}
+
+.step-player.controls-hidden.progress-notice-visible .player-topline {
+  opacity: 1;
+  pointer-events: auto;
+  transform: none;
 }
 
 .step-player.controls-hidden .transport {
@@ -2390,7 +2429,7 @@ select:focus-visible {
   }
 
   .player-topline {
-    align-items: flex-start;
+    align-items: stretch;
     flex-direction: column;
   }
 
@@ -2439,12 +2478,17 @@ select:focus-visible {
   }
 
   .step-player .player-topline {
-    align-items: center;
-    flex-direction: row;
+    align-items: stretch;
+    flex-direction: column;
   }
 
-  .step-player .player-topline > div:first-child {
+  .step-player .player-topline-main > div:first-child {
     min-width: 0;
+  }
+
+  .step-player .player-topline-main {
+    align-items: center;
+    padding: 10px 11px;
   }
 
   .step-player .player-topline span {
@@ -2452,6 +2496,23 @@ select:focus-visible {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .step-player .player-topline .progressive-playback-status span {
+    max-width: none;
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+  }
+
+  .progressive-playback-status {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .progressive-playback-status > div {
+    width: 100%;
+    justify-content: flex-end;
   }
 
   .step-player .player-tools {
@@ -2755,6 +2816,54 @@ select:focus-visible {
   margin: 10px 0 16px;
   color: var(--muted);
   font-size: 0.8rem;
+}
+
+.processing-long-note {
+  display: grid;
+  gap: 5px;
+  margin: 0 0 16px;
+  padding: 11px 12px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius);
+  color: var(--text);
+  background: var(--accent-tint-weak);
+  text-align: left;
+}
+
+.processing-long-note strong {
+  color: var(--amber);
+  font-size: 0.84rem;
+}
+
+.processing-long-note span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+.progressive-playback-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--accent-border);
+  color: var(--text);
+  background: var(--accent-tint-weak);
+  font-size: 0.78rem;
+}
+
+.progressive-playback-status strong {
+  flex: 0 0 auto;
+  color: var(--teal);
+  font-variant-numeric: tabular-nums;
+}
+
+.progressive-playback-status > div {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  flex: 0 0 auto;
 }
 
 .processing-steps {
@@ -3083,7 +3192,18 @@ select:focus-visible {
 }
 
 .timeline.seekable > div {
+  position: relative;
+  z-index: 2;
   border-radius: 999px;
+}
+
+.timeline.seekable .generated-range {
+  position: absolute;
+  z-index: 1;
+  inset: 0 auto 0 0;
+  border-radius: 999px;
+  background: rgba(61, 214, 182, 0.28);
+  pointer-events: none;
 }
 
 .seek-handle {
@@ -3097,6 +3217,7 @@ select:focus-visible {
   transform: translate(-50%, -50%);
   box-shadow: 0 1px 5px rgba(0, 0, 0, 0.55);
   opacity: 0;
+  z-index: 3;
   transition: opacity 120ms ease;
   pointer-events: none;
 }
