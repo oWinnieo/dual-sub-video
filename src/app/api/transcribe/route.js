@@ -13,7 +13,8 @@ export const runtime = 'nodejs';
 export const maxDuration = 600;
 
 const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
-const STREAM_FIRST_SEGMENT_SECONDS = 2 * 60;
+const STREAM_STARTUP_SEGMENT_SECONDS = [60, 60, 2 * 60];
+const STREAM_FIRST_SEGMENT_SECONDS = STREAM_STARTUP_SEGMENT_SECONDS[0];
 const STREAM_SEGMENT_SECONDS = 3 * 60;
 
 // GET -> pipeline health (used by the UI's "Repair transcription" check).
@@ -52,7 +53,7 @@ function resolveSamplePath(samplePath) {
   return resolved;
 }
 
-function streamTranscription({ mediaPath, language, quality, job, status, cleanupDir, signal }) {
+function streamTranscription({ mediaPath, language, quality, job, status, cleanupDir, signal, resumeFromSeconds = 0 }) {
   const encoder = new TextEncoder();
   const send = (controller, event) => {
     if (signal?.aborted) return false;
@@ -75,6 +76,8 @@ function streamTranscription({ mediaPath, language, quality, job, status, cleanu
             jobId: job.id,
             segmentSeconds: STREAM_SEGMENT_SECONDS,
             firstSegmentSeconds: STREAM_FIRST_SEGMENT_SECONDS,
+            startupSegmentSeconds: STREAM_STARTUP_SEGMENT_SECONDS,
+            resumeFromSeconds,
             signal,
             onProgress: (progress) => send(controller, progress),
             onSegment: (segment) => send(controller, { type: 'segment', ...segment }),
@@ -149,6 +152,7 @@ export async function POST(request) {
     let language = 'auto';
     let quality = 'fast';
     let streamRequested = false;
+    let resumeFromSeconds = 0;
 
     if (contentType.includes('multipart/form-data')) {
       // Browser path (next dev / web): the video is uploaded as a File.
@@ -160,6 +164,7 @@ export async function POST(request) {
       language = form.get('language') || 'auto';
       quality = form.get('quality') || 'fast';
       streamRequested = form.get('stream') === '1';
+      resumeFromSeconds = Math.max(0, Number(form.get('resumeFromSeconds')) || 0);
       job = {
         ...job,
         source: 'browser-upload',
@@ -176,6 +181,7 @@ export async function POST(request) {
       language = body.language || 'auto';
       quality = body.quality || 'fast';
       streamRequested = body.stream === true;
+      resumeFromSeconds = Math.max(0, Number(body.resumeFromSeconds) || 0);
       if (body.path) {
         mediaPath = body.path;
         job = { ...job, source: 'desktop-path', fileName: path.basename(mediaPath), stage: 'validating-media' };
@@ -222,6 +228,7 @@ export async function POST(request) {
         status,
         cleanupDir: ownedCleanupDir,
         signal: request.signal,
+        resumeFromSeconds,
       });
     }
     const {

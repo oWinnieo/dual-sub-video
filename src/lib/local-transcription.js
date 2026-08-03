@@ -9,6 +9,7 @@ import {
   languageTokenCandidatesFromBeams,
   summarizeLanguageTokenSamples,
 } from './whisper-language-detection.js';
+import { resumableProgressiveSegmentRanges } from './progressive-buffer.js';
 
 const require = createRequire(import.meta.url);
 const DEFAULT_HOME = path.join(os.homedir(), '.lingoloop');
@@ -1022,6 +1023,8 @@ export async function runWhisperJob(jobSpec) {
         durationSeconds: mediaDurationSeconds,
         segmentSeconds,
         firstSegmentSeconds: Math.max(0, Number(jobSpec.firstSegmentSeconds) || segmentSeconds),
+        startupSegmentSeconds: jobSpec.startupSegmentSeconds,
+        resumeFromSeconds: Math.max(0, Number(jobSpec.resumeFromSeconds) || 0),
         onProgress: jobSpec.onProgress,
         onSegment: jobSpec.onSegment,
         signal: jobSpec.signal,
@@ -1137,17 +1140,25 @@ async function runSegmentedWhisperJob(plan, {
   durationSeconds,
   segmentSeconds,
   firstSegmentSeconds,
+  startupSegmentSeconds,
+  resumeFromSeconds,
   onProgress,
   onSegment,
   signal,
   stages,
 }) {
-  const initialEnd = Math.min(durationSeconds, firstSegmentSeconds || segmentSeconds);
-  const segmentRanges = [{ start: 0, end: initialEnd }];
-  for (let start = initialEnd; start < durationSeconds; start += segmentSeconds) {
-    segmentRanges.push({ start, end: Math.min(durationSeconds, start + segmentSeconds) });
-  }
-  const totalSegments = segmentRanges.length;
+  const startupPlan = Array.isArray(startupSegmentSeconds) && startupSegmentSeconds.length
+    ? startupSegmentSeconds
+    : [firstSegmentSeconds || segmentSeconds];
+  const segmentPlan = resumableProgressiveSegmentRanges(
+    durationSeconds,
+    resumeFromSeconds,
+    startupPlan,
+    segmentSeconds,
+  );
+  const segmentRanges = segmentPlan.ranges;
+  const initialEnd = Math.min(durationSeconds, startupPlan[0] || segmentSeconds);
+  const totalSegments = segmentPlan.totalSegments;
   const allCues = [];
   let detectedLanguage = plan.language === 'auto' ? null : plan.language;
   let languageDetection = null;
@@ -1163,16 +1174,18 @@ async function runSegmentedWhisperJob(plan, {
     durationSeconds,
     segmentSeconds,
     firstSegmentSeconds: initialEnd,
+    startupSegmentSeconds: startupPlan,
+    resumeFromSeconds: Math.max(0, Number(resumeFromSeconds) || 0),
     totalSegments,
   });
 
-  for (let index = 0; index < totalSegments; index += 1) {
+  for (const segmentRange of segmentRanges) {
+    const { index, start, end } = segmentRange;
     if (signal?.aborted) {
       const error = stageFailure('cancelled', 'Transcription was cancelled.');
       error.code = 'TRANSCRIPTION_CANCELLED';
       throw error;
     }
-    const { start, end } = segmentRanges[index];
     const contextStart = Math.max(0, start - SEGMENT_CONTEXT_SECONDS);
     const contextEnd = Math.min(durationSeconds, end + SEGMENT_CONTEXT_SECONDS);
     const chunkDuration = contextEnd - contextStart;

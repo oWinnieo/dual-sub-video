@@ -475,18 +475,19 @@ select:focus-visible {
   position: absolute;
   top: 12px;
   right: 12px;
-  display: inline-grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  padding: 0;
-  color: var(--muted);
-  background: var(--tint-2);
 }
 
-.config-close-button:hover:not(:disabled) {
+.config-card .config-close-button,
+.config-card .config-close-button:hover:not(:disabled),
+.config-card .config-close-button:focus-visible {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+
+.config-card .config-close-button:hover:not(:disabled),
+.config-card .config-close-button:focus-visible {
   color: var(--text);
-  border-color: var(--line-strong);
 }
 
 .config-media-line {
@@ -1004,6 +1005,68 @@ select:focus-visible {
   background: var(--accent-tint-weak);
 }
 
+.compact-progressive-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  max-width: 210px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  color: var(--muted);
+  background: rgba(10, 13, 12, 0.72);
+  font-size: 0.72rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.compact-progressive-status:hover,
+.compact-progressive-status:focus-visible {
+  color: var(--text);
+  border-color: var(--accent-border);
+  background: var(--accent-tint-weak);
+}
+
+.player-topline .compact-progressive-status span,
+.player-topline .compact-progressive-status strong {
+  display: inline;
+  max-width: none;
+  margin: 0;
+  color: inherit;
+  font-size: inherit;
+  line-height: 1;
+}
+
+.player-topline .compact-progressive-status strong {
+  color: var(--teal);
+  font-variant-numeric: tabular-nums;
+}
+
+.compact-progressive-status i {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--soft);
+}
+
+.compact-progressive-status.active i,
+.compact-progressive-status.priority i {
+  background: var(--teal);
+  box-shadow: 0 0 0 4px rgba(61, 214, 182, 0.12);
+}
+
+.compact-progressive-status.pausing i,
+.compact-progressive-status.paused i {
+  background: #efb54d;
+  box-shadow: 0 0 0 4px rgba(239, 181, 77, 0.12);
+}
+
+.compact-progressive-status.stopped i {
+  background: var(--soft);
+}
+
 .tooltip-control {
   position: relative;
 }
@@ -1148,6 +1211,46 @@ select:focus-visible {
 .step-player.controls-hidden .video-status {
   opacity: 0;
   transform: translateY(-6px);
+}
+
+.priority-seek-waiting {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: min(430px, calc(100% - 32px));
+  padding: 13px 15px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius);
+  color: var(--text);
+  background: rgba(8, 11, 10, 0.9);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(14px);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.priority-seek-waiting > svg {
+  flex: 0 0 auto;
+  color: var(--amber);
+}
+
+.priority-seek-waiting div {
+  display: grid;
+  gap: 3px;
+}
+
+.priority-seek-waiting strong {
+  font-size: 0.82rem;
+}
+
+.priority-seek-waiting span {
+  color: var(--muted);
+  font-size: 0.74rem;
+  line-height: 1.4;
 }
 
 .loop-dock {
@@ -1348,6 +1451,16 @@ select:focus-visible {
 .subtitle-stack h3 {
   color: var(--subtitle-translation-color, #ffffff);
   font-size: clamp(0.85rem, 1.15vw, 1.08rem);
+  font-weight: 600;
+}
+
+.source-only-translation-status {
+  padding: 4px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  color: rgba(243, 246, 241, 0.74);
+  background: rgba(0, 0, 0, 0.58);
+  font-size: clamp(0.68rem, 0.9vw, 0.78rem);
   font-weight: 600;
 }
 
@@ -2525,6 +2638,16 @@ select:focus-visible {
     height: 34px;
   }
 
+  .compact-progressive-status {
+    max-width: 104px;
+    min-height: 30px;
+    padding-inline: 8px;
+  }
+
+  .compact-progress-through {
+    display: none !important;
+  }
+
   .select-control,
   .primary-action {
     width: 100%;
@@ -2841,6 +2964,46 @@ select:focus-visible {
   line-height: 1.5;
 }
 
+.progressive-start-choice {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 16px;
+  padding: 13px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius);
+  color: var(--text);
+  background: var(--tint-2);
+  text-align: left;
+}
+
+.progressive-start-choice > strong {
+  color: var(--teal);
+  font-size: 0.88rem;
+}
+
+.progressive-start-choice > span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.55;
+}
+
+.progressive-start-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 3px;
+}
+
+.progressive-start-actions > :only-child {
+  grid-column: 1 / -1;
+}
+
+.progressive-start-actions button {
+  min-height: 38px;
+  padding: 0 12px;
+  font-size: 0.78rem;
+}
+
 .progressive-playback-status {
   display: flex;
   align-items: center;
@@ -2913,9 +3076,24 @@ select:focus-visible {
   background: var(--teal);
 }
 
-.processing-cancel {
-  width: 100%;
+.processing-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
   margin-top: 16px;
+}
+
+.processing-actions > :only-child {
+  grid-column: 1 / -1;
+}
+
+.processing-actions .secondary-action {
+  width: 100%;
+  height: 40px;
+  min-height: 40px;
+  margin: 0;
+  padding: 0 12px;
+  line-height: 1;
 }
 
 /* ---- Redesign: landing copy, topbar tools, library drawer ------------- */
@@ -3191,6 +3369,37 @@ select:focus-visible {
   height: 11px;
 }
 
+.timeline-hover-time {
+  position: absolute;
+  bottom: calc(100% + 9px);
+  z-index: 12;
+  min-width: 48px;
+  padding: 5px 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  color: var(--text);
+  background: rgba(7, 6, 4, 0.96);
+  box-shadow: 0 5px 16px rgba(0, 0, 0, 0.36);
+  font-size: 0.72rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  text-align: center;
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.timeline-hover-time::after {
+  content: '';
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  border: 5px solid transparent;
+  border-top-color: rgba(7, 6, 4, 0.96);
+  transform: translateX(-50%);
+}
+
 .timeline.seekable > div {
   position: relative;
   z-index: 2;
@@ -3204,6 +3413,15 @@ select:focus-visible {
   border-radius: 999px;
   background: rgba(61, 214, 182, 0.28);
   pointer-events: none;
+}
+
+.timeline.seekable .generated-range.source-only {
+  background: rgba(239, 181, 77, 0.24);
+}
+
+.timeline.seekable .generated-range.translated-range {
+  z-index: 2;
+  background: rgba(61, 214, 182, 0.38);
 }
 
 .seek-handle {
@@ -3225,6 +3443,13 @@ select:focus-visible {
 .timeline.seekable:hover .seek-handle,
 .timeline.seekable:focus-visible .seek-handle {
   opacity: 1;
+}
+
+.seek-handle.pending {
+  opacity: 1;
+  border-color: var(--amber);
+  background: var(--amber);
+  box-shadow: 0 0 0 4px rgba(239, 181, 77, 0.18);
 }
 
 .rate-button {

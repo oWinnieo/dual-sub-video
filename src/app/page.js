@@ -3,6 +3,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { transcribeVideo } from '@/lib/asr-engines';
 import {
+  estimateProgressiveBuffer,
+  continuousGeneratedThrough,
+  generatedCoverageSeconds,
+  generatedRangeAt,
+  mergeGeneratedRange,
+  mergeProgressiveCues,
+  MIN_SAFETY_BUFFER_SECONDS,
+  progressiveResumeCheckpoint,
+  progressiveTranslationConcurrency,
+  selectPrioritySegmentIndex,
+  splitTranslationBatches,
+} from '@/lib/progressive-buffer';
+import {
   AlertTriangle,
   AudioWaveform,
   BookOpen,
@@ -29,6 +42,7 @@ import {
   Settings,
   SlidersHorizontal,
   Sparkles,
+  Square,
   Trash2,
   Upload,
   Volume2,
@@ -118,7 +132,7 @@ const languages = [
 const TRANSLATION_TIMEOUT_MS = 60_000;
 const TRANSLATION_MAX_ATTEMPTS = 3;
 const TRANSLATION_RECOVERY_DELAY_MS = 1800;
-const PROGRESSIVE_FIRST_SEGMENT_SECONDS = 2 * 60;
+const PROGRESSIVE_FIRST_SEGMENT_SECONDS = 60;
 const PROGRESSIVE_SEGMENT_SECONDS = 3 * 60;
 const PROGRESS_NOTICE_AUTO_HIDE_MS = 8_000;
 
@@ -378,12 +392,14 @@ function wordsFromText(text) {
 
 function enrichCue(cue, index) {
   const original = stripTags(cue.original || '');
+  const translationPending = Boolean(cue.translationPending);
   return {
     id: cue.id || `cue-${index + 1}`,
     start: Number(cue.start) || 0,
     end: Number(cue.end) || (Number(cue.start) || 0) + 3,
     original,
-    translation: stripTags(cue.translation || original),
+    translation: translationPending ? stripTags(cue.translation || '') : stripTags(cue.translation || original),
+    translationPending,
     translationError: cue.translationError || null,
     reading: cue.reading || wordsFromText(original).map((word) => word.reading).join(' '),
     speaker: cue.speaker || `S${(index % 2) + 1}`,
@@ -393,10 +409,13 @@ function enrichCue(cue, index) {
 }
 
 function normalizeCuesForPlayback(nextCues) {
-  return nextCues
+  const normalized = nextCues
     .map(enrichCue)
     .filter((cue) => cue.original && Number.isFinite(cue.start) && Number.isFinite(cue.end))
-    .map((cue) => ({ ...cue, end: Math.max(cue.start + 0.08, cue.end) }))
+    .map((cue) => ({ ...cue, end: Math.max(cue.start + 0.08, cue.end) }));
+  const byId = new Map();
+  normalized.forEach((cue) => byId.set(cue.id, cue));
+  return Array.from(byId.values())
     .sort((left, right) => left.start - right.start || left.end - right.end);
 }
 
@@ -586,7 +605,7 @@ function missingTranscriptionChecks(status) {
 }
 
 function countTranslationFailures(list) {
-  return list.filter((cue) => cue.translationError).length;
+  return list.filter((cue) => cue.translationError || cue.translationPending).length;
 }
 
 function csvRows(text) {
@@ -846,6 +865,14 @@ export default function Home() {
   const mediaFileRef = useRef(null);
   const processingCancelRef = useRef(false);
   const transcriptionAbortRef = useRef(null);
+  const translationAbortControllersRef = useRef(new Set());
+  const progressiveStartupRef = useRef(null);
+  const progressiveProcessedThroughRef = useRef(0);
+  const generatedRangesRef = useRef([]);
+  const sourceRangesRef = useRef([]);
+  const translatedRangesRef = useRef([]);
+  const pendingPrioritySeekRef = useRef(null);
+  const progressiveJobRef = useRef(null);
   const activeItemIdRef = useRef(null);
   const libraryRef = useRef([]);
   const [viewStep, setViewStep] = useState('landing');
@@ -869,6 +896,8 @@ export default function Home() {
   const [processingStage, setProcessingStage] = useState('');
   const [processingProgress, setProcessingProgress] = useState(0);
   const [progressiveJob, setProgressiveJob] = useState(null);
+  const [progressiveStartDecision, setProgressiveStartDecision] = useState(null);
+  const [pendingPrioritySeek, setPendingPrioritySeek] = useState(null);
   const [activeEngine, setActiveEngine] = useState(null);
   const [targetLang, setTargetLang] = useState('en');
   const [pendingLanguageChange, setPendingLanguageChange] = useState(null);
@@ -895,16 +924,19 @@ export default function Home() {
   const [panelTab, setPanelTab] = useState('queue');
   const [muted, setMuted] = useState(false);
   const [batchSize, setBatchSize] = useState(50);
-  const [concurrency, setConcurrency] = useState(3);
+  const [concurrency, setConcurrency] = useState(2);
   const [cacheEnabled, setCacheEnabled] = useState(true);
+  const [allowSourceOnlyPlayback, setAllowSourceOnlyPlayback] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackTime, setPlaybackTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [timelineHoverTime, setTimelineHoverTime] = useState(null);
   const timelineRef = useRef(null);
   const positionSaveRef = useRef(0);
   const playbackSyncFrameRef = useRef(null);
   const playbackSyncTickRef = useRef(0);
+  const playbackTimeRef = useRef(0);
   const [selectedWord, setSelectedWord] = useState(null);
   const [mediaName, setMediaName] = useState('demo-media.mp4');
   const [mediaUrl, setMediaUrl] = useState('');
@@ -993,6 +1025,14 @@ export default function Home() {
     if (playbackSyncFrameRef.current) window.cancelAnimationFrame(playbackSyncFrameRef.current);
     transcriptionAbortRef.current?.abort();
   }, []);
+
+  useEffect(() => {
+    playbackTimeRef.current = playbackTime;
+  }, [playbackTime]);
+
+  useEffect(() => {
+    progressiveJobRef.current = progressiveJob;
+  }, [progressiveJob]);
 
   useEffect(() => {
     try {
@@ -1310,6 +1350,18 @@ export default function Home() {
   const selectLibraryItem = (item, options = {}) => {
     if (!item) return;
     videoRef.current?.pause();
+    progressiveStartupRef.current = null;
+    progressiveProcessedThroughRef.current = item.progressiveJob?.processedThrough || 0;
+    generatedRangesRef.current = item.progressiveJob?.generatedRanges
+      || (item.progressiveJob?.processedThrough
+        ? [{ start: 0, end: item.progressiveJob.processedThrough }]
+        : []);
+    sourceRangesRef.current = item.progressiveJob?.sourceRanges || generatedRangesRef.current;
+    translatedRangesRef.current = item.progressiveJob?.translatedRanges
+      || (item.progressiveJob?.sourceOnlyPlayback ? [] : generatedRangesRef.current);
+    pendingPrioritySeekRef.current = null;
+    setPendingPrioritySeek(null);
+    setProgressiveStartDecision(null);
     setProgressiveJob(item.progressiveJob || null);
     activeItemIdRef.current = item.id;
     setActiveItemId(item.id);
@@ -1559,6 +1611,42 @@ export default function Home() {
     setStatusMessage(`${nextQueue.length} media files queued for offline processing.`);
   };
 
+  const enterProgressivePlayer = (message) => {
+    setViewStep('player');
+    setProcessing(false);
+    setIsPlaying(false);
+    setProgressiveStartDecision(null);
+    if (message) setStatusMessage(message);
+  };
+
+  const chooseProgressiveStart = (mode) => {
+    const startup = progressiveStartupRef.current;
+    if (!startup) return;
+    const nextStartup = { ...startup, mode, released: mode === 'immediate' };
+    progressiveStartupRef.current = nextStartup;
+    setProgressiveJob((current) => (current ? { ...current, startupMode: mode } : current));
+
+    if (mode === 'immediate') {
+      enterProgressivePlayer(
+        `已生成至 ${clockShort(nextStartup.processedThrough)}，可以立即观看；字幕会继续在后台生成。`,
+      );
+      return;
+    }
+
+    if (nextStartup.processedThrough >= nextStartup.targetBufferSeconds - 0.5) {
+      progressiveStartupRef.current = { ...nextStartup, released: true };
+      enterProgressivePlayer(
+        `安全缓冲已就绪：已生成 ${clockShort(nextStartup.processedThrough)}，可以开始流畅观看。`,
+      );
+      return;
+    }
+
+    setProgressiveStartDecision(nextStartup);
+    setProcessingStage(
+      `正在建立安全缓冲 · 已生成 ${clockShort(nextStartup.processedThrough)} / ${clockShort(nextStartup.targetBufferSeconds)}`,
+    );
+  };
+
   // Full "video -> dual subtitles" pipeline, shown behind the loading screen:
   //   1. transcribe with the local native worker, then
   //   2. translate the resulting cues into the target language.
@@ -1567,6 +1655,11 @@ export default function Home() {
     const jobItemId = activeItemIdRef.current;
     const jobSourceLang = options.sourceLanguage || sourceLang;
     const jobTargetLang = options.targetLanguage || targetLang;
+    const resumeJob = options.resumeJob?.resumable ? options.resumeJob : null;
+    const isResuming = Boolean(resumeJob);
+    const jobAllowSourceOnlyPlayback = resumeJob?.sourceOnlyPlayback
+      ?? options.allowSourceOnlyPlayback
+      ?? allowSourceOnlyPlayback;
     if (!file && !mediaPath) {
       setStatusMessage('Import a video or audio file before transcribing.');
       return;
@@ -1578,7 +1671,7 @@ export default function Home() {
     }
     // Lock the language/model selections for this job. UI changes made while
     // the async pipeline is running must only affect the next job.
-    const jobQuality = quality;
+    const jobQuality = resumeJob?.quality || quality;
 
     videoRef.current?.pause();
     setIsPlaying(false);
@@ -1586,19 +1679,114 @@ export default function Home() {
     setTranscribing(true);
     setTranslationDone(false);
     setActiveEngine('node-whisper');
-    setSubtitleOrigin('unprocessed');
+    if (!isResuming) setSubtitleOrigin('unprocessed');
     setTranscriptionTrace(createTranscriptionTrace(file, mediaPath));
     setTranscriptionDebug(null);
-    setProgressiveJob(null);
+    progressiveStartupRef.current = isResuming ? { mode: 'resume', released: true } : null;
+    progressiveProcessedThroughRef.current = resumeJob?.processedThrough || 0;
+    generatedRangesRef.current = resumeJob?.generatedRanges || [];
+    sourceRangesRef.current = resumeJob?.sourceRanges || generatedRangesRef.current;
+    translatedRangesRef.current = resumeJob?.translatedRanges
+      || (jobAllowSourceOnlyPlayback ? [] : generatedRangesRef.current);
+    pendingPrioritySeekRef.current = null;
+    setPendingPrioritySeek(null);
+    setProgressiveStartDecision(null);
+    const resumedActiveJob = isResuming ? {
+      ...resumeJob,
+      active: true,
+      paused: false,
+      cancelled: false,
+      stage: `正在从 ${clockShort(resumeJob.resumeFromSeconds || 0)} 继续生成`,
+    } : null;
+    progressiveJobRef.current = resumedActiveJob;
+    setProgressiveJob(resumedActiveJob);
     processingCancelRef.current = false;
     const transcriptionController = new AbortController();
     transcriptionAbortRef.current = transcriptionController;
     setProcessingKind('full');
-    setProcessing(true);
+    setProcessing(!isResuming);
     setProcessingProgress(0.02);
     setProcessingStage('Preparing');
-    let streamedTranslatedCues = [];
-    let streamedDetectedLanguage = null;
+    let streamedTranslatedCues = normalizeCuesForPlayback(
+      resumeJob?.translatedCues
+      || (isResuming ? cues.filter((cue) => !cue.translationPending) : []),
+    );
+    let streamedSourceCues = normalizeCuesForPlayback(
+      resumeJob?.sourceCues
+      || (isResuming ? cues : []),
+    );
+    let streamedDetectedLanguage = resumeJob?.detectedLanguage || detectedLang || null;
+    const progressiveStartedAt = Date.now();
+    const pendingTranslationSegments = [];
+    const completedTranslationSegments = new Set(resumeJob?.completedTranslationSegments || []);
+    let translationQueueRunning = false;
+    let translationQueuePromise = Promise.resolve();
+    let translationQueueError = null;
+
+    const startTranslationQueue = () => {
+      if (translationQueueRunning || translationQueueError) return;
+      translationQueueRunning = true;
+      translationQueuePromise = (async () => {
+        while (pendingTranslationSegments.length && !processingCancelRef.current) {
+          const priorityIndex = selectPrioritySegmentIndex(pendingTranslationSegments, {
+            playbackTime: pendingPrioritySeekRef.current?.time ?? playbackTimeRef.current,
+          });
+          const [nextItem] = pendingTranslationSegments.splice(Math.max(0, priorityIndex), 1);
+          setProgressiveJob((current) => (current ? {
+            ...current,
+            queuedSegments: pendingTranslationSegments.length,
+            prioritySegment: nextItem.segment.index + 1,
+          } : current));
+          try {
+            await nextItem.run();
+          } catch (error) {
+            translationQueueError = error;
+            pendingTranslationSegments.length = 0;
+          }
+        }
+      })().finally(() => {
+        translationQueueRunning = false;
+        if (pendingTranslationSegments.length && !translationQueueError && !processingCancelRef.current) {
+          startTranslationQueue();
+        }
+      });
+    };
+
+    const enqueueSegmentTranslation = (segment, run) => {
+      pendingTranslationSegments.push({ segment, run });
+      setProgressiveJob((current) => (current ? {
+        ...current,
+        queuedSegments: pendingTranslationSegments.length,
+      } : current));
+      startTranslationQueue();
+    };
+
+    const waitForTranslationQueue = async () => {
+      while (translationQueueRunning || pendingTranslationSegments.length) {
+        const currentQueuePromise = translationQueuePromise;
+        await currentQueuePromise;
+      }
+      if (translationQueueError) throw translationQueueError;
+    };
+
+    const resolvePendingPrioritySeek = (playableRanges, mediaLength) => {
+      const pendingSeek = pendingPrioritySeekRef.current;
+      const pendingRange = pendingSeek
+        ? generatedRangeAt(playableRanges, pendingSeek.time)
+        : null;
+      const readyThrough = pendingSeek
+        ? Math.min(mediaLength || pendingSeek.time + 30, pendingSeek.time + 30)
+        : 0;
+      if (!pendingSeek || !pendingRange || pendingRange.end < readyThrough - 0.5) return false;
+      pendingPrioritySeekRef.current = null;
+      setPendingPrioritySeek(null);
+      playbackTimeRef.current = pendingSeek.time;
+      setPlaybackTime(pendingSeek.time);
+      setStatusMessage(
+        `${clockShort(pendingSeek.time)} 附近的${jobAllowSourceOnlyPlayback ? '原文' : '双语'}字幕已经生成，可以从这里开始播放。`,
+      );
+      return true;
+    };
 
     try {
       updateTranscriptionTrace('preflight', 'running', 'Checking the local native transcription worker.');
@@ -1637,10 +1825,11 @@ export default function Home() {
         totalSegments: transcribedSegmentCount,
       } = await transcribeVideo(file, {
         engine: 'node-whisper',
-        language: jobSourceLang,
+        language: isResuming && streamedDetectedLanguage ? streamedDetectedLanguage : jobSourceLang,
         quality: jobQuality,
         mediaPath,
         progressive: true,
+        resumeFromSeconds: resumeJob?.resumeFromSeconds || 0,
         signal: transcriptionController.signal,
         onEngine: (eng) => setActiveEngine(eng),
         onProgress: (fraction, stage, progressEvent) => {
@@ -1658,105 +1847,309 @@ export default function Home() {
           setProcessingStage(stage || 'Transcribing');
           setProcessingProgress(Math.min(0.96, fraction));
           if (progressEvent?.totalSegments) {
-            const completedSegments = progressEvent.type === 'segment'
+            const transcriptionCompletedSegments = progressEvent.type === 'segment'
               ? progressEvent.index + 1
               : progressEvent.index;
-            const processedThrough = progressEvent.type === 'segment'
-              ? progressEvent.end
-              : progressEvent.start;
-            const nextJob = {
-              active: true,
+            setProgressiveJob((current) => ({
+              ...current,
+              active: !(progressEvent.type === 'segment'
+                && progressEvent.index + 1 >= progressEvent.totalSegments),
               isLong: progressEvent.totalSegments > 1,
               firstSegmentSeconds: progressEvent.firstSegmentSeconds || PROGRESSIVE_FIRST_SEGMENT_SECONDS,
               segmentSeconds: PROGRESSIVE_SEGMENT_SECONDS,
               totalSegments: progressEvent.totalSegments,
-              completedSegments,
-              processedThrough,
-              duration: progressEvent.durationSeconds || duration,
+              transcriptionCompletedSegments,
+              processedThrough: current?.processedThrough || 0,
+              duration: progressEvent.durationSeconds || current?.duration || duration,
               stage: stage || 'Transcribing',
-              percent: Math.round(fraction * 100),
-            };
-            setProgressiveJob((current) => ({ ...current, ...nextJob }));
-            if (activeItemIdRef.current) {
-              updateLibraryItem(activeItemIdRef.current, {
+              transcriptionPercent: Math.round(fraction * 100),
+              percent: current?.percent || 0,
+            }));
+            if (jobItemId) {
+              updateLibraryItem(jobItemId, {
                 status: 'processing',
-                progress: nextJob.percent,
-                stage: nextJob.stage,
-                progressiveJob: nextJob,
+                progress: Math.round(fraction * 100),
+                stage: stage || 'Transcribing',
               });
             }
           }
         },
-        onSegment: async (segment) => {
+        onSegment: (segment) => {
           if (processingCancelRef.current || !segment.cues?.length) return;
           const segmentDetected = segment.detectedLanguage || streamedDetectedLanguage;
           streamedDetectedLanguage = segmentDetected;
+          const hadSourceCues = streamedSourceCues.length > 0;
+          const sourceSegment = segment.cues.map((cue, cueIndex) => enrichCue({
+            ...cue,
+            translation: '',
+            translationPending: true,
+          }, cueIndex));
+          streamedSourceCues = normalizeCuesForPlayback([
+            ...streamedSourceCues,
+            ...sourceSegment,
+          ]);
+          sourceRangesRef.current = mergeGeneratedRange(
+            sourceRangesRef.current,
+            { start: segment.start, end: segment.end },
+          );
+
+          if (jobAllowSourceOnlyPlayback) {
+            generatedRangesRef.current = sourceRangesRef.current;
+            const sourceProcessedThrough = continuousGeneratedThrough(sourceRangesRef.current);
+            progressiveProcessedThroughRef.current = sourceProcessedThrough;
+            const sourceCoverage = generatedCoverageSeconds(sourceRangesRef.current);
+            const sourceOnlyCues = normalizeCuesForPlayback(
+              mergeProgressiveCues(streamedSourceCues, streamedTranslatedCues),
+            );
+            const sourceProgress = Math.min(100, Math.round(
+              (sourceCoverage / Math.max(1, segment.durationSeconds || duration || sourceCoverage)) * 100,
+            ));
+            const sourceJob = {
+              active: true,
+              isLong: segment.totalSegments > 1,
+              firstSegmentSeconds: segment.firstSegmentSeconds || PROGRESSIVE_FIRST_SEGMENT_SECONDS,
+              segmentSeconds: PROGRESSIVE_SEGMENT_SECONDS,
+              totalSegments: segment.totalSegments,
+              processedThrough: sourceProcessedThrough,
+              generatedRanges: sourceRangesRef.current,
+              generatedCoverage: sourceCoverage,
+              sourceRanges: sourceRangesRef.current,
+              translatedRanges: translatedRangesRef.current,
+              sourceOnlyPlayback: true,
+              duration: segment.durationSeconds || duration,
+              percent: sourceProgress,
+              stage: `原文已生成至 ${clockShort(sourceProcessedThrough)}，中文翻译正在追赶`,
+              translationConcurrency: progressiveTranslationConcurrency(concurrency),
+              sourceCues: streamedSourceCues,
+              translatedCues: streamedTranslatedCues,
+              detectedLanguage: segmentDetected || null,
+              sourceLanguage: jobSourceLang,
+              targetLanguage: jobTargetLang,
+              quality: jobQuality,
+              completedTranslationSegments: Array.from(completedTranslationSegments),
+            };
+            setCues(sourceOnlyCues);
+            setSourceMode('transcribe');
+            setSubtitleOrigin('transcription');
+            setDetectedLang(segmentDetected || null);
+            setTranslationDone(false);
+            progressiveJobRef.current = { ...(progressiveJobRef.current || {}), ...sourceJob };
+            setProgressiveJob((current) => ({ ...current, ...sourceJob }));
+            resolvePendingPrioritySeek(sourceRangesRef.current, segment.durationSeconds || duration);
+
+            if (!hadSourceCues && sourceOnlyCues.length) {
+              progressiveStartupRef.current = { mode: 'source-only', released: true };
+              setPlaybackTime(sourceOnlyCues[0]?.start ?? 0);
+              setSelectedWord(sourceOnlyCues[0]?.words?.[0] ?? null);
+              enterProgressivePlayer('原文字幕已经可以播放，中文翻译会在后台逐批补上。');
+            }
+            if (jobItemId) {
+              updateLibraryItem(jobItemId, {
+                status: 'processing',
+                progress: sourceProgress,
+                stage: sourceJob.stage,
+                cues: sourceOnlyCues,
+                detectedLang: segmentDetected || null,
+                sourceLanguage: jobSourceLang,
+                translatedTo: jobTargetLang,
+                progressiveJob: sourceJob,
+              });
+            }
+          }
+
           const effectiveSource = (jobSourceLang === 'detect' || jobSourceLang === 'none')
             ? (segmentDetected || 'auto')
             : jobSourceLang;
-          setProcessingStage(`Translating segment ${segment.index + 1} of ${segment.totalSegments}`);
-          setTranslationRunning(true);
-          const translatedSegment = await translateList(
-            segment.cues.map(enrichCue),
-            effectiveSource,
-            jobTargetLang,
-            (completed, total) => {
-              setProcessingStage(`Translating segment ${segment.index + 1} of ${segment.totalSegments} · cue ${completed} of ${total}`);
-            },
-            () => processingCancelRef.current,
-            { maxAttempts: 2, timeoutMs: 20_000, recoverFailures: false },
-          );
-          setTranslationRunning(false);
-          if (processingCancelRef.current) return;
+          const translatedCueIds = new Set(streamedTranslatedCues.map((cue) => cue.id));
+          const enrichedSegment = segment.cues
+            .filter((cue) => !translatedCueIds.has(cue.id))
+            .map(enrichCue);
+          if (!enrichedSegment.length) {
+            completedTranslationSegments.add(segment.index);
+            return;
+          }
+          const translationBatches = splitTranslationBatches(enrichedSegment);
+          let translatedInSegment = 0;
+          let nextBatchIndex = 0;
+          const runNextBatch = async () => {
+            if (processingCancelRef.current || nextBatchIndex >= translationBatches.length) return;
+            setTranslationRunning(true);
+            const batchIndex = nextBatchIndex;
+            const batch = translationBatches[batchIndex];
+            const batchOffset = translatedInSegment;
+            const translatedBatch = await translateList(
+              batch,
+              effectiveSource,
+              jobTargetLang,
+              (completed) => {
+                const translatedCount = batchOffset + completed;
+                setProcessingStage(
+                  `Translating segment ${segment.index + 1} of ${segment.totalSegments} · cue ${translatedCount} of ${enrichedSegment.length}`,
+                );
+              },
+              () => processingCancelRef.current,
+              {
+                maxAttempts: 2,
+                timeoutMs: 20_000,
+                recoverFailures: false,
+                maxWorkers: progressiveTranslationConcurrency(concurrency),
+              },
+            );
+            if (processingCancelRef.current) return;
 
-          const hadPlayableCues = streamedTranslatedCues.length > 0;
-          streamedTranslatedCues = normalizeCuesForPlayback([
-            ...streamedTranslatedCues,
-            ...translatedSegment,
-          ]);
-          const completedSegments = segment.index + 1;
-          const processedThrough = segment.end;
-          const percent = Math.round((completedSegments / segment.totalSegments) * 100);
-          const nextProgressiveJob = {
-            active: completedSegments < segment.totalSegments,
-            isLong: segment.totalSegments > 1,
-            firstSegmentSeconds: segment.firstSegmentSeconds || PROGRESSIVE_FIRST_SEGMENT_SECONDS,
-            segmentSeconds: PROGRESSIVE_SEGMENT_SECONDS,
-            totalSegments: segment.totalSegments,
-            completedSegments,
-            processedThrough,
-            duration: segment.durationSeconds || duration,
-            stage: completedSegments < segment.totalSegments
-              ? `第 ${completedSegments + 1}/${segment.totalSegments} 段正在后台生成`
-              : '全部分段已生成',
-            percent,
-          };
-          setCues(streamedTranslatedCues);
-          setSourceMode('transcribe');
-          setSubtitleOrigin('transcription');
-          setDetectedLang(segmentDetected || null);
-          setProgressiveJob(nextProgressiveJob);
-          if (!hadPlayableCues && streamedTranslatedCues.length) {
-            setPlaybackTime(streamedTranslatedCues[0]?.start ?? 0);
-            setSelectedWord(streamedTranslatedCues[0]?.words?.[0] ?? null);
-            setViewStep('player');
-            setProcessing(false);
-            setStatusMessage(`前 ${clockShort(processedThrough)} 的双语字幕已生成，可以开始观看；剩余内容会在后台继续生成。`);
-          }
-          if (activeItemIdRef.current) {
-            updateLibraryItem(activeItemIdRef.current, {
-              status: completedSegments < segment.totalSegments ? 'processing' : 'done',
-              progress: percent,
-              stage: nextProgressiveJob.stage,
-              cues: streamedTranslatedCues,
-              detectedLang: segmentDetected || null,
-              sourceLanguage: jobSourceLang,
-              translatedTo: jobTargetLang,
-              progressiveJob: nextProgressiveJob,
+            const hadTranslatedCues = streamedTranslatedCues.length > 0;
+            translatedInSegment += translatedBatch.length;
+            streamedTranslatedCues = normalizeCuesForPlayback([
+              ...streamedTranslatedCues,
+              ...translatedBatch,
+            ]);
+            const segmentComplete = batchIndex === translationBatches.length - 1;
+            const lastBatchCue = translatedBatch[translatedBatch.length - 1];
+            const batchGeneratedThrough = segmentComplete
+              ? segment.end
+              : Math.min(segment.end, lastBatchCue?.end || segment.start);
+            translatedRangesRef.current = mergeGeneratedRange(
+              translatedRangesRef.current,
+              { start: segment.start, end: batchGeneratedThrough },
+            );
+            generatedRangesRef.current = jobAllowSourceOnlyPlayback
+              ? sourceRangesRef.current
+              : translatedRangesRef.current;
+            const processedThrough = continuousGeneratedThrough(generatedRangesRef.current);
+            progressiveProcessedThroughRef.current = processedThrough;
+            const generatedCoverage = generatedCoverageSeconds(generatedRangesRef.current);
+            const translatedCoverage = generatedCoverageSeconds(translatedRangesRef.current);
+            const elapsedSeconds = Math.max(0.1, (Date.now() - progressiveStartedAt) / 1000);
+            const bufferEstimate = estimateProgressiveBuffer({
+              processedThrough,
+              elapsedSeconds,
+              durationSeconds: segment.durationSeconds || duration,
             });
-          }
+            if (segmentComplete) completedTranslationSegments.add(segment.index);
+            const completedSegments = completedTranslationSegments.size;
+            const allSegmentsComplete = completedSegments >= segment.totalSegments;
+            const percent = Math.min(100, Math.round(
+              (generatedCoverage / Math.max(1, segment.durationSeconds || duration || generatedCoverage)) * 100,
+            ));
+            const priorityTarget = pendingPrioritySeekRef.current?.time;
+            const nextStage = allSegmentsComplete
+              ? '全部分段已生成'
+              : jobAllowSourceOnlyPlayback
+                ? `原文可播放，中文已完成 ${completedSegments}/${segment.totalSegments} 段`
+              : Number.isFinite(priorityTarget)
+                ? `正在优先生成 ${clockShort(priorityTarget)} 附近 · 已完成 ${completedSegments}/${segment.totalSegments} 段`
+                : segmentComplete
+                  ? `已完成 ${completedSegments}/${segment.totalSegments} 段，继续生成播放位置之后的字幕`
+                : `第 ${segment.index + 1}/${segment.totalSegments} 段已翻译 ${translatedInSegment}/${enrichedSegment.length} 条`;
+            const currentStartup = progressiveStartupRef.current;
+            const nextProgressiveJob = {
+              active: !allSegmentsComplete,
+              isLong: segment.totalSegments > 1,
+              firstSegmentSeconds: segment.firstSegmentSeconds || PROGRESSIVE_FIRST_SEGMENT_SECONDS,
+              segmentSeconds: PROGRESSIVE_SEGMENT_SECONDS,
+              totalSegments: segment.totalSegments,
+              completedSegments,
+              processedThrough,
+              generatedRanges: generatedRangesRef.current,
+              generatedCoverage,
+              sourceRanges: sourceRangesRef.current,
+              translatedRanges: translatedRangesRef.current,
+              translatedCoverage,
+              sourceOnlyPlayback: jobAllowSourceOnlyPlayback,
+              duration: segment.durationSeconds || duration,
+              stage: nextStage,
+              percent,
+              generationRate: bufferEstimate.generationRate,
+              targetBufferSeconds: bufferEstimate.targetBufferSeconds,
+              estimatedWaitSeconds: bufferEstimate.estimatedWaitSeconds,
+              startupMode: currentStartup?.mode || 'pending',
+              queuedSegments: pendingTranslationSegments.length,
+              prioritySegment: segment.index + 1,
+              translationConcurrency: progressiveTranslationConcurrency(concurrency),
+              sourceCues: streamedSourceCues,
+              translatedCues: streamedTranslatedCues,
+              detectedLanguage: segmentDetected || null,
+              sourceLanguage: jobSourceLang,
+              targetLanguage: jobTargetLang,
+              quality: jobQuality,
+              completedTranslationSegments: Array.from(completedTranslationSegments),
+            };
+
+            const playbackCues = jobAllowSourceOnlyPlayback
+              ? normalizeCuesForPlayback(mergeProgressiveCues(streamedSourceCues, streamedTranslatedCues))
+              : streamedTranslatedCues;
+            setCues(playbackCues);
+            setSourceMode('transcribe');
+            setSubtitleOrigin('transcription');
+            setDetectedLang(segmentDetected || null);
+            progressiveJobRef.current = nextProgressiveJob;
+            setProgressiveJob(nextProgressiveJob);
+            setProcessingProgress(Math.min(0.96, percent / 100));
+            if (!jobAllowSourceOnlyPlayback && !hadTranslatedCues
+              && streamedTranslatedCues.length && !pendingPrioritySeekRef.current) {
+              setPlaybackTime(streamedTranslatedCues[0]?.start ?? 0);
+              setSelectedWord(streamedTranslatedCues[0]?.words?.[0] ?? null);
+            }
+
+            resolvePendingPrioritySeek(generatedRangesRef.current, segment.durationSeconds || duration);
+
+            if (currentStartup && !jobAllowSourceOnlyPlayback) {
+              const updatedStartup = {
+                ...currentStartup,
+                processedThrough,
+                generationRate: bufferEstimate.generationRate,
+                targetBufferSeconds: bufferEstimate.targetBufferSeconds,
+                estimatedWaitSeconds: bufferEstimate.estimatedWaitSeconds,
+              };
+              progressiveStartupRef.current = updatedStartup;
+              setProgressiveStartDecision((current) => (current ? updatedStartup : current));
+              if (updatedStartup.mode === 'smooth' && !updatedStartup.released
+                && processedThrough >= updatedStartup.targetBufferSeconds - 0.5) {
+                progressiveStartupRef.current = { ...updatedStartup, released: true };
+                enterProgressivePlayer(
+                  `安全缓冲已就绪：已生成 ${clockShort(processedThrough)}，后台会继续生成剩余字幕。`,
+                );
+              }
+            }
+
+            if (!jobAllowSourceOnlyPlayback && segment.index === 0 && segmentComplete && segment.totalSegments > 1
+              && !progressiveStartupRef.current) {
+              const startupDecision = {
+                mode: 'choose',
+                released: false,
+                processedThrough,
+                generationRate: bufferEstimate.generationRate,
+                targetBufferSeconds: bufferEstimate.targetBufferSeconds,
+                estimatedWaitSeconds: bufferEstimate.estimatedWaitSeconds,
+              };
+              progressiveStartupRef.current = startupDecision;
+              setProgressiveStartDecision(startupDecision);
+              setProcessingStage('首段双语字幕已生成，请选择观看方式');
+            }
+
+            if (jobItemId) {
+              updateLibraryItem(jobItemId, {
+                status: allSegmentsComplete ? 'done' : 'processing',
+                progress: percent,
+                stage: nextStage,
+                cues: playbackCues,
+                detectedLang: segmentDetected || null,
+                sourceLanguage: jobSourceLang,
+                translatedTo: jobTargetLang,
+                progressiveJob: nextProgressiveJob,
+              });
+            }
+            nextBatchIndex += 1;
+            setTranslationRunning(false);
+            if (nextBatchIndex < translationBatches.length && !processingCancelRef.current) {
+              enqueueSegmentTranslation(segment, runNextBatch);
+            }
+          };
+          enqueueSegmentTranslation(segment, runNextBatch);
         },
       });
+
+      await waitForTranslationQueue();
 
       if (processingCancelRef.current) return;
 
@@ -1921,10 +2314,18 @@ export default function Home() {
 
       // Move the viewer into the player once dual subs are ready. The video
       // stays paused — press Play whenever you're ready.
+      progressiveStartupRef.current = null;
+      setProgressiveStartDecision(null);
+      pendingPrioritySeekRef.current = null;
+      setPendingPrioritySeek(null);
       setViewStep('player');
       if (!streamedTranslatedCues.length) setIsPlaying(false);
     } catch (error) {
       if (!processingCancelRef.current) {
+        progressiveStartupRef.current = null;
+        setProgressiveStartDecision(null);
+        pendingPrioritySeekRef.current = null;
+        setPendingPrioritySeek(null);
         const nativeStage = error.job?.stage || error.stage || 'native-pipeline';
         const recognitionRejected = error.code === 'ASR_HALLUCINATION' || error.code === 'NO_SPEECH';
         const traceStage = nativeStage === 'preflight'
@@ -1937,14 +2338,17 @@ export default function Home() {
         if (jobItemId) {
           setLibrary((current) => current.map((item) => {
             if (item.id !== jobItemId) return item;
-            const hasPartialCues = Boolean(item.cues?.length || streamedTranslatedCues.length);
+            const partialCues = jobAllowSourceOnlyPlayback
+              ? normalizeCuesForPlayback(mergeProgressiveCues(streamedSourceCues, streamedTranslatedCues))
+              : streamedTranslatedCues;
+            const hasPartialCues = Boolean(item.cues?.length || partialCues.length);
             return {
               ...item,
               status: hasPartialCues ? 'partial' : 'failed',
               progress: hasPartialCues ? item.progress : 0,
               stage: hasPartialCues ? '后台生成中断' : '生成失败',
               error: error.message,
-              cues: streamedTranslatedCues.length ? streamedTranslatedCues : item.cues,
+              cues: partialCues.length ? partialCues : item.cues,
             };
           }));
         }
@@ -1961,6 +2365,22 @@ export default function Home() {
       if (transcriptionAbortRef.current === transcriptionController) transcriptionAbortRef.current = null;
       setTranslationRunning(false);
       setTranscribing(false);
+      if (progressiveJobRef.current?.pausing) {
+        const pausedJob = {
+          ...progressiveJobRef.current,
+          pausing: false,
+          stage: `已暂停，可从 ${clockShort(progressiveJobRef.current.resumeFromSeconds || 0)} 继续生成`,
+        };
+        progressiveJobRef.current = pausedJob;
+        setProgressiveJob(pausedJob);
+        if (jobItemId) {
+          updateLibraryItem(jobItemId, {
+            status: 'partial',
+            stage: pausedJob.stage,
+            progressiveJob: pausedJob,
+          });
+        }
+      }
       // Let the completed bar render briefly before it disappears.
       window.setTimeout(() => setProcessing(false), 450);
     }
@@ -1980,16 +2400,87 @@ export default function Home() {
     setStatusMessage('配置已关闭。视频仍保留在 Your library，可重新生成或删除。');
   };
 
-  const cancelProcessing = () => {
+  const pauseProcessing = () => {
+    const current = progressiveJobRef.current || progressiveJob;
+    if (!current?.active || !current.generatedRanges?.length) return;
     processingCancelRef.current = true;
     transcriptionAbortRef.current?.abort();
     transcriptionAbortRef.current = null;
-    const cancelledJob = progressiveJob ? {
-      ...progressiveJob,
+    translationAbortControllersRef.current.forEach((controller) => controller.abort('Subtitle generation paused.'));
+    translationAbortControllersRef.current.clear();
+    progressiveStartupRef.current = null;
+    setProgressiveStartDecision(null);
+    pendingPrioritySeekRef.current = null;
+    setPendingPrioritySeek(null);
+    const resumeFromSeconds = progressiveResumeCheckpoint({
+      durationSeconds: current.duration || duration,
+      completedSegmentIndexes: current.completedTranslationSegments,
+    });
+    const pausedJob = {
+      ...current,
       active: false,
+      paused: true,
+      pausing: true,
+      cancelled: false,
+      resumable: true,
+      resumeFromSeconds,
+      stage: `正在暂停，将保留已生成内容并从 ${clockShort(resumeFromSeconds)} 继续`,
+    };
+    progressiveJobRef.current = pausedJob;
+    setProgressiveJob(pausedJob);
+    if (activeItemIdRef.current) {
+      updateLibraryItem(activeItemIdRef.current, {
+        status: 'partial',
+        stage: pausedJob.stage,
+        cues,
+        progressiveJob: pausedJob,
+      });
+    }
+    setProcessing(false);
+    if (cues.length) setViewStep('player');
+    setStatusMessage(`字幕生成正在安全暂停；已生成内容不会丢失，稍后可从 ${clockShort(resumeFromSeconds)} 继续。`);
+  };
+
+  const resumeProcessing = () => {
+    const current = progressiveJobRef.current || progressiveJob;
+    if (!current?.resumable || current.pausing || transcribing || translationRunning) return;
+    if (!mediaFileRef.current && !mediaPath) {
+      setStatusMessage('原视频当前不可用，请重新选择同一个视频后再继续生成。');
+      return;
+    }
+    setProgressNoticeVisible(true);
+    setStatusMessage(`正在从 ${clockShort(current.resumeFromSeconds || 0)} 恢复字幕生成，已有字幕会保留。`);
+    processVideo({
+      resumeJob: current,
+      sourceLanguage: current.detectedLanguage || current.sourceLanguage || sourceLang,
+      targetLanguage: current.targetLanguage || targetLang,
+      allowSourceOnlyPlayback: current.sourceOnlyPlayback,
+    });
+  };
+
+  const cancelProcessing = () => {
+    const current = progressiveJobRef.current || progressiveJob;
+    if ((current?.active || current?.paused) && current.processedThrough
+      && !window.confirm('确定结束本次后台生成吗？\n\n已生成的字幕会保留，但“结束”后不会显示继续按钮；如果只是暂时不生成，请选择“暂停并保留进度”。')) return;
+    processingCancelRef.current = true;
+    transcriptionAbortRef.current?.abort();
+    transcriptionAbortRef.current = null;
+    translationAbortControllersRef.current.forEach((controller) => controller.abort('Subtitle generation stopped.'));
+    translationAbortControllersRef.current.clear();
+    progressiveStartupRef.current = null;
+    setProgressiveStartDecision(null);
+    pendingPrioritySeekRef.current = null;
+    setPendingPrioritySeek(null);
+    const cancelledJob = current ? {
+      ...current,
+      active: false,
+      paused: false,
+      pausing: false,
       cancelled: true,
+      resumable: false,
       stage: '后台生成已停止',
     } : null;
+    progressiveJobRef.current = cancelledJob;
     setProgressiveJob(cancelledJob);
     if (activeItemIdRef.current) {
       updateLibraryItem(activeItemIdRef.current, {
@@ -2158,14 +2649,47 @@ export default function Home() {
   };
 
   const mediaDuration = duration || cues[cues.length - 1]?.end || 0;
+  const generatedRanges = progressiveJob?.generatedRanges?.length
+    ? progressiveJob.generatedRanges
+    : progressiveJob?.processedThrough > 0
+      ? [{ start: 0, end: progressiveJob.processedThrough }]
+      : [];
+  const generatedCoverage = progressiveJob?.generatedCoverage
+    || generatedCoverageSeconds(generatedRanges);
+  const translatedRanges = progressiveJob?.translatedRanges || generatedRanges;
   const progressiveIncomplete = Boolean(
     progressiveJob?.isLong
-    && progressiveJob.processedThrough > 0
-    && progressiveJob.processedThrough < (progressiveJob.duration || mediaDuration),
+    && generatedRanges.length
+    && (progressiveJob.active
+      || generatedCoverage < (progressiveJob.duration || mediaDuration) - 0.5),
   );
-  const playableThrough = progressiveIncomplete
-    ? Math.min(mediaDuration || progressiveJob.processedThrough, progressiveJob.processedThrough)
-    : mediaDuration;
+  const currentGeneratedRange = progressiveIncomplete
+    ? generatedRangeAt(generatedRanges, playbackTime)
+    : { start: 0, end: mediaDuration };
+  const canPlayCurrentPosition = Boolean(
+    playbackReady
+    && !pendingPrioritySeek
+    && (!progressiveIncomplete || currentGeneratedRange),
+  );
+  const playableThrough = currentGeneratedRange?.end || 0;
+  const bufferAheadSeconds = progressiveIncomplete
+    ? Math.max(0, (currentGeneratedRange?.end || playbackTime) - playbackTime)
+    : Math.max(0, mediaDuration - playbackTime);
+  const targetBufferSeconds = progressiveJob?.targetBufferSeconds || MIN_SAFETY_BUFFER_SECONDS;
+  const progressiveBufferLow = Boolean(
+    progressiveIncomplete
+    && progressiveJob?.active
+    && bufferAheadSeconds < Math.min(MIN_SAFETY_BUFFER_SECONDS, targetBufferSeconds),
+  );
+  const compactProgressState = pendingPrioritySeek
+    ? { kind: 'priority', label: '优先生成' }
+    : progressiveJob?.active
+      ? { kind: 'active', label: '生成中' }
+      : progressiveJob?.pausing
+        ? { kind: 'pausing', label: '正在暂停' }
+        : progressiveJob?.paused
+          ? { kind: 'paused', label: '已暂停' }
+          : { kind: 'stopped', label: '已停止' };
 
   useEffect(() => {
     if (progressNoticeTimerRef.current) window.clearTimeout(progressNoticeTimerRef.current);
@@ -2200,9 +2724,35 @@ export default function Home() {
   const positionKey = mediaName ? `${mediaName}:${mediaFileRef.current?.size || 0}` : null;
 
   const syncVideoTime = (time) => {
-    const clamped = clamp(time, 0, playableThrough || mediaDuration || time);
-    if (videoRef.current) videoRef.current.currentTime = clamped;
-    setPlaybackTime(clamped);
+    const target = clamp(time, 0, mediaDuration || time);
+    const targetRange = generatedRangeAt(generatedRanges, target);
+    if (progressiveIncomplete && progressiveJob?.active && !targetRange) {
+      videoRef.current?.pause();
+      setIsPlaying(false);
+      const pendingSeek = { time: target, requestedAt: Date.now() };
+      pendingPrioritySeekRef.current = pendingSeek;
+      setPendingPrioritySeek(pendingSeek);
+      playbackTimeRef.current = target;
+      if (videoRef.current) videoRef.current.currentTime = target;
+      setPlaybackTime(target);
+      setProgressNoticeVisible(true);
+      setProgressiveJob((current) => (current ? {
+        ...current,
+        stage: `正在优先生成 ${clockShort(target)} 附近的双语字幕`,
+        priorityTime: target,
+      } : current));
+      setStatusMessage(`已定位到 ${clockShort(target)}，正在优先生成这里及后续字幕，完成前保持暂停。`);
+      return;
+    }
+
+    pendingPrioritySeekRef.current = null;
+    setPendingPrioritySeek(null);
+    const fallback = progressiveIncomplete && !targetRange
+      ? Math.max(0, playableThrough - 0.1)
+      : target;
+    playbackTimeRef.current = fallback;
+    if (videoRef.current) videoRef.current.currentTime = fallback;
+    setPlaybackTime(fallback);
   };
 
   const seekBy = (delta) => {
@@ -2216,6 +2766,16 @@ export default function Home() {
     if (!rect || !rect.width || !mediaDuration) return;
     const fraction = clamp((clientX - rect.left) / rect.width, 0, 1);
     syncVideoTime(fraction * mediaDuration);
+  };
+
+  const updateTimelineHover = (clientX) => {
+    const rect = timelineRef.current?.getBoundingClientRect();
+    if (!rect || !rect.width || !mediaDuration) {
+      setTimelineHoverTime(null);
+      return;
+    }
+    const fraction = clamp((clientX - rect.left) / rect.width, 0, 1);
+    setTimelineHoverTime(fraction * mediaDuration);
   };
 
   // VLC-style scrubbing: click anywhere on the bar to jump, drag to scrub.
@@ -2271,10 +2831,12 @@ export default function Home() {
 
   const togglePlayback = async () => {
     setControlsVisible(true);
-    if (!playbackReady) {
+    if (!playbackReady || pendingPrioritySeek || (progressiveIncomplete && !currentGeneratedRange)) {
       videoRef.current?.pause();
       setIsPlaying(false);
-      setStatusMessage('Playback stays paused until transcription and translation are complete.');
+      setStatusMessage(pendingPrioritySeek
+        ? `正在优先生成 ${clockShort(pendingPrioritySeek.time)} 附近的字幕，完成前保持暂停。`
+        : '当前位置的双语字幕尚未生成，播放保持暂停。');
       return;
     }
     if (videoRef.current && mediaUrl) {
@@ -2351,6 +2913,7 @@ export default function Home() {
     const maxAttempts = Math.max(1, Number(options.maxAttempts) || TRANSLATION_MAX_ATTEMPTS);
     const timeoutMs = Math.max(5000, Number(options.timeoutMs) || TRANSLATION_TIMEOUT_MS);
     const recoverFailures = options.recoverFailures !== false;
+    const requestedWorkers = options.maxWorkers ?? concurrency;
     const translateOne = async (cue) => {
       const translationContext = {
         cueId: cue.id,
@@ -2364,6 +2927,7 @@ export default function Home() {
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         if (shouldCancel()) return cue;
         const controller = new AbortController();
+        translationAbortControllersRef.current.add(controller);
         const timeout = window.setTimeout(
           () => controller.abort(`Translation timed out after ${timeoutMs / 1000} seconds.`),
           timeoutMs,
@@ -2419,7 +2983,12 @@ export default function Home() {
                 translated: translatedText,
               });
             }
-            return { ...cue, translation: translatedText, translationError: null };
+            return {
+              ...cue,
+              translation: translatedText,
+              translationError: null,
+              translationPending: false,
+            };
           }
 
           const errorBody = await response.text().catch(() => '');
@@ -2454,6 +3023,7 @@ export default function Home() {
           });
         } finally {
           window.clearTimeout(timeout);
+          translationAbortControllersRef.current.delete(controller);
         }
 
         if (attempt < maxAttempts) {
@@ -2478,12 +3048,13 @@ export default function Home() {
         ...cue,
         translation: cue.translation || cue.original,
         translationError: lastFailure,
+        translationPending: false,
       };
     };
 
     // Bounded worker pool: honours the Concurrency setting instead of firing
     // every cue at once (which rate-limited the translator on long videos).
-    const maxWorkers = Math.max(1, Math.min(12, Number(concurrency) || 4));
+    const maxWorkers = Math.max(1, Math.min(12, Number(requestedWorkers) || 2));
     const results = new Array(list.length);
     let nextIndex = 0;
     let completedCount = 0;
@@ -2702,13 +3273,47 @@ export default function Home() {
             </p>
             {processingKind === 'full' && progressiveJob?.isLong ? (
               <div className="processing-long-note">
-                <strong>由于视频较长，将先生成约 2 分钟内容</strong>
+                <strong>
+                  {allowSourceOnlyPlayback ? '原文字幕先行已开启' : '由于视频较长，将先生成约 1 分钟内容'}
+                </strong>
                 <span>
-                  首段完成后即可开始观看（约整体进度 {Math.max(1, Math.ceil(
+                  {allowSourceOnlyPlayback
+                    ? '首段原文识别完成后即可播放，中文翻译会继续在后台逐批补上。'
+                    : `首段约占整体进度 ${Math.max(1, Math.ceil(
                     ((progressiveJob.firstSegmentSeconds || PROGRESSIVE_FIRST_SEGMENT_SECONDS)
                       / Math.max(1, progressiveJob.duration || duration)) * 100,
-                  ))}%），后续按 3 分钟一段继续在后台生成。
+                  ))}%。完成后会根据实际生成速度计算安全缓冲；启动阶段按 1、1、2 分钟识别，之后按 3 分钟一段继续生成。`}
                 </span>
+              </div>
+            ) : null}
+            {processingKind === 'full' && progressiveStartDecision ? (
+              <div className="progressive-start-choice">
+                <strong>
+                  {progressiveStartDecision.mode === 'smooth' ? '正在等待流畅播放缓冲' : '首段已经生成，可以开始观看'}
+                </strong>
+                <span>
+                  当前生成速度约为播放速度的 {progressiveStartDecision.generationRate.toFixed(2)} 倍；
+                  建议先生成到 {clockShort(progressiveStartDecision.targetBufferSeconds)}。
+                  {progressiveStartDecision.estimatedWaitSeconds > 1
+                    ? ` 预计还需等待约 ${clockShort(progressiveStartDecision.estimatedWaitSeconds)}。`
+                    : ' 当前安全缓冲已经充足。'}
+                </span>
+                <div className="progressive-start-actions">
+                  {progressiveStartDecision.mode === 'choose' ? (
+                    <>
+                      <button type="button" className="primary-action" onClick={() => chooseProgressiveStart('smooth')}>
+                        等待流畅播放
+                      </button>
+                      <button type="button" className="secondary-action" onClick={() => chooseProgressiveStart('immediate')}>
+                        立即开始
+                      </button>
+                    </>
+                  ) : (
+                    <button type="button" className="secondary-action" onClick={() => chooseProgressiveStart('immediate')}>
+                      改为立即开始
+                    </button>
+                  )}
+                </div>
               </div>
             ) : null}
             {processingKind === 'translation' ? (
@@ -2728,7 +3333,12 @@ export default function Home() {
                 </li>
               </ol>
             )}
-            <button type="button" className="secondary-action processing-cancel" onClick={cancelProcessing}>Cancel</button>
+            <div className="processing-actions">
+              {progressiveJob?.generatedRanges?.length ? (
+                <button type="button" className="secondary-action" onClick={pauseProcessing}>暂停并保留进度</button>
+              ) : null}
+              <button type="button" className="secondary-action" onClick={cancelProcessing}>结束生成</button>
+            </div>
           </div>
         </div>
       ) : null}
@@ -2765,16 +3375,13 @@ export default function Home() {
       {viewStep === 'config' ? (
         <section className="config-flow" aria-label="Configure">
           <div className="config-card">
-            <button
-              type="button"
+            <IconButton
+              label="关闭生成配置"
+              icon={X}
               className="config-close-button"
-              aria-label="关闭生成配置"
-              title="关闭生成配置"
               disabled={processing || transcribing || translationRunning}
               onClick={closeConfig}
-            >
-              <X size={18} />
-            </button>
+            />
             <div className="config-media-line">
               <Film size={18} />
               <span>{mediaName}</span>
@@ -2880,13 +3487,26 @@ export default function Home() {
                 </div>
                 <div className="player-tools">
                   {progressiveIncomplete && !progressNoticeVisible ? (
-                    <IconButton
-                      label={`显示后台生成进度：已生成至 ${clockShort(progressiveJob.processedThrough)}，${progressiveJob.percent}%`}
-                      icon={Clock}
-                      active
-                      className="progressive-status-toggle"
-                      onClick={showProgressNotice}
-                    />
+                    <>
+                      <IconButton
+                        label={`显示后台生成进度：已生成至 ${clockShort(progressiveJob.processedThrough)}，${progressiveJob.percent}%`}
+                        icon={Clock}
+                        active
+                        className="progressive-status-toggle"
+                        onClick={showProgressNotice}
+                      />
+                      <button
+                        type="button"
+                        className={`compact-progressive-status ${compactProgressState.kind}`}
+                        aria-label={`后台生成状态：${compactProgressState.label}，${progressiveJob.percent || 0}%，已生成至 ${clockShort(progressiveJob.processedThrough)}`}
+                        onClick={showProgressNotice}
+                      >
+                        <i aria-hidden="true" />
+                        <span>{compactProgressState.label}</span>
+                        <strong>{progressiveJob.percent || 0}%</strong>
+                        <span className="compact-progress-through">至 {clockShort(progressiveJob.processedThrough)}</span>
+                      </button>
+                    </>
                   ) : null}
                   <IconButton label="Your video library" icon={Menu} onClick={() => setLibraryOpen(true)} />
                   <IconButton
@@ -2909,18 +3529,31 @@ export default function Home() {
               {progressiveIncomplete && progressNoticeVisible ? (
                 <div className="progressive-playback-status" role="status" aria-live="polite">
                   <span>
-                    {progressiveJob.active
-                      ? `已生成至 ${clockShort(progressiveJob.processedThrough)}，可以边看边等；${progressiveJob.stage}`
-                      : `后台生成已停止，当前可播放到 ${clockShort(progressiveJob.processedThrough)}`}
+                    {pendingPrioritySeek
+                      ? `正在优先生成 ${clockShort(pendingPrioritySeek.time)} 附近及之后的字幕；当前翻译并发 ${progressiveJob.translationConcurrency || 2}`
+                      : progressiveJob.active
+                      ? `已生成至 ${clockShort(progressiveJob.processedThrough)}，前方缓冲 ${clockShort(bufferAheadSeconds)}${progressiveBufferLow ? '（缓冲偏低）' : ''}；${progressiveJob.stage}`
+                      : progressiveJob.paused
+                        ? `${progressiveJob.pausing ? '正在安全暂停' : '后台生成已暂停'}，当前可播放到 ${clockShort(progressiveJob.processedThrough)}；恢复点 ${clockShort(progressiveJob.resumeFromSeconds || 0)}`
+                        : `后台生成已停止，当前可播放到 ${clockShort(progressiveJob.processedThrough)}`}
                   </span>
                   <div>
                     <strong>{progressiveJob.percent}%</strong>
                     {progressiveJob.active ? (
-                      <IconButton
-                        label="停止后台生成"
-                        icon={Pause}
-                        onClick={cancelProcessing}
-                      />
+                      <>
+                        <IconButton label="暂停并保留生成进度" icon={Pause} onClick={pauseProcessing} />
+                        <IconButton label="结束后台生成" icon={Square} onClick={cancelProcessing} />
+                      </>
+                    ) : progressiveJob.paused ? (
+                      <>
+                        <IconButton
+                          label={progressiveJob.pausing ? '正在等待安全暂停点' : '继续生成字幕'}
+                          icon={Play}
+                          disabled={progressiveJob.pausing || transcribing || translationRunning}
+                          onClick={resumeProcessing}
+                        />
+                        <IconButton label="结束后台生成" icon={Square} onClick={cancelProcessing} />
+                      </>
                     ) : null}
                     <IconButton
                       label="隐藏生成进度提示"
@@ -2946,19 +3579,29 @@ export default function Home() {
                     // Continue watching: jump back to where this video was left.
                     const saved = loadPositions()[positionKey];
                     if (saved?.t > 5 && (!video.duration || saved.t < video.duration - 5)) {
-                      video.currentTime = saved.t;
-                      setPlaybackTime(saved.t);
-                      setStatusMessage(`Resumed from ${clockShort(saved.t)}. Press Play to continue.`);
+                      syncVideoTime(saved.t);
+                      if (generatedRangeAt(generatedRanges, saved.t)) {
+                        setStatusMessage(`Resumed from ${clockShort(saved.t)}. Press Play to continue.`);
+                      }
                     }
                   }}
                   onTimeUpdate={(event) => {
                     const video = event.currentTarget;
-                    if (progressiveIncomplete && playableThrough > 0 && video.currentTime >= playableThrough) {
+                    if (pendingPrioritySeekRef.current) {
                       video.pause();
-                      video.currentTime = Math.max(0, playableThrough - 0.1);
                       setIsPlaying(false);
-                      setStatusMessage(`已播放到当前生成位置 ${clockShort(playableThrough)}，后续字幕仍在后台生成。`);
+                      setPlaybackTime(pendingPrioritySeekRef.current.time);
+                      return;
                     }
+                    const activeRange = generatedRangeAt(generatedRanges, Math.max(0, video.currentTime - 0.1));
+                    if (progressiveIncomplete && (!activeRange || video.currentTime >= activeRange.end - 0.05)) {
+                      video.pause();
+                      const stopAt = Math.max(0, (activeRange?.end || playableThrough) - 0.1);
+                      video.currentTime = stopAt;
+                      setIsPlaying(false);
+                      setStatusMessage(`已播放到当前生成区间末尾 ${clockShort(stopAt)}，后续字幕仍在后台生成。`);
+                    }
+                    playbackTimeRef.current = video.currentTime;
                     setPlaybackTime(video.currentTime);
                     // Remember the position every few seconds while playing.
                     if (Math.abs(video.currentTime - positionSaveRef.current) > 3) {
@@ -2967,28 +3610,43 @@ export default function Home() {
                     }
                   }}
                   onPlay={(event) => {
-                    if (!playbackReady) {
+                    const activeRange = generatedRangeAt(generatedRanges, event.currentTarget.currentTime);
+                    if (!playbackReady || pendingPrioritySeek || (progressiveIncomplete && !activeRange)) {
                       event.currentTarget.pause();
                       setIsPlaying(false);
-                      setStatusMessage('Playback stays paused until transcription and translation are complete.');
+                      setStatusMessage(pendingPrioritySeek
+                        ? `正在优先生成 ${clockShort(pendingPrioritySeek.time)} 附近的字幕，完成前保持暂停。`
+                        : '当前位置的双语字幕尚未生成，播放保持暂停。');
                       return;
                     }
-                    if (progressiveIncomplete && playableThrough > 0 && event.currentTarget.currentTime >= playableThrough - 0.1) {
+                    if (progressiveIncomplete && activeRange
+                      && event.currentTarget.currentTime >= activeRange.end - 0.1) {
                       event.currentTarget.pause();
                       setIsPlaying(false);
-                      setStatusMessage(`后续内容仍在生成中，目前可播放到 ${clockShort(playableThrough)}。`);
+                      setStatusMessage(`后续内容仍在生成中，当前区间可播放到 ${clockShort(activeRange.end)}。`);
                       return;
                     }
+                    playbackTimeRef.current = event.currentTarget.currentTime;
                     setPlaybackTime(event.currentTarget.currentTime);
                     setIsPlaying(true);
                   }}
                   onSeeking={(event) => {
-                    if (progressiveIncomplete && playableThrough > 0 && event.currentTarget.currentTime > playableThrough) {
-                      event.currentTarget.currentTime = Math.max(0, playableThrough - 0.1);
+                    const target = event.currentTarget.currentTime;
+                    if (progressiveIncomplete && !generatedRangeAt(generatedRanges, target)) {
+                      if (!pendingPrioritySeekRef.current
+                        || Math.abs(pendingPrioritySeekRef.current.time - target) > 0.5) {
+                        syncVideoTime(target);
+                      }
+                      return;
                     }
+                    playbackTimeRef.current = target;
+                    setPlaybackTime(target);
+                  }}
+                  onSeeked={(event) => {
+                    if (pendingPrioritySeekRef.current) return;
+                    playbackTimeRef.current = event.currentTarget.currentTime;
                     setPlaybackTime(event.currentTarget.currentTime);
                   }}
-                  onSeeked={(event) => setPlaybackTime(event.currentTarget.currentTime)}
                   onPause={(event) => {
                     setIsPlaying(false);
                     savePlaybackPosition(positionKey, event.currentTarget.currentTime, event.currentTarget.duration);
@@ -3005,6 +3663,15 @@ export default function Home() {
               ) : (
                 <div className="scene-grid" aria-hidden="true"><span /><span /><span /><span /></div>
               )}
+              {pendingPrioritySeek ? (
+                <div className="priority-seek-waiting" role="status" aria-live="polite">
+                  <Clock size={18} />
+                  <div>
+                    <strong>正在优先生成 {clockShort(pendingPrioritySeek.time)} 附近字幕</strong>
+                    <span>当前小批次完成后会优先处理这里；若 Whisper 尚未识别到此处则继续等待，字幕准备好前视频保持暂停。</span>
+                  </div>
+                </div>
+              ) : null}
               {maskMode !== 'off' && maskMode !== 'hide' ? (
                 <div
                   className={`subtitle-mask-overlay ${maskMode}${maskEditing ? ' editing' : ''}`}
@@ -3036,7 +3703,11 @@ export default function Home() {
                   }}
                 >
                   <h2><span>{activeCue.original}</span></h2>
-                  <h3><span>{activeCue.translation}</span></h3>
+                  {activeCue.translationPending ? (
+                    <small className="source-only-translation-status">原文可用 · 中文翻译正在追赶</small>
+                  ) : (
+                    <h3><span>{activeCue.translation}</span></h3>
+                  )}
                 </div>
               ) : null}
             </div>
@@ -3045,9 +3716,9 @@ export default function Home() {
               <button
                 type="button"
                 className="play-button"
-                aria-label={playbackReady ? (isPlaying ? 'Pause (Space)' : 'Play (Space)') : 'Waiting for completed subtitles'}
-                title={playbackReady ? (isPlaying ? 'Pause (Space)' : 'Play (Space)') : 'Playback unlocks after transcription and translation finish'}
-                disabled={!playbackReady}
+                aria-label={canPlayCurrentPosition ? (isPlaying ? 'Pause (Space)' : 'Play (Space)') : 'Waiting for subtitles near this position'}
+                title={canPlayCurrentPosition ? (isPlaying ? 'Pause (Space)' : 'Play (Space)') : 'Playback unlocks when subtitles near this position are ready'}
+                disabled={!canPlayCurrentPosition}
                 onClick={togglePlayback}
               >
                 {isPlaying ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}
@@ -3065,20 +3736,55 @@ export default function Home() {
                 aria-valuenow={Math.round(playbackTime) || 0}
                 aria-valuetext={`${clockShort(playbackTime)} of ${clockShort(mediaDuration)}`}
                 onPointerDown={handleSeekPointerDown}
+                onPointerMove={(event) => updateTimelineHover(event.clientX)}
+                onPointerLeave={() => setTimelineHoverTime(null)}
+                onBlur={() => setTimelineHoverTime(null)}
                 onKeyDown={(event) => {
                   if (event.key === 'ArrowRight') { event.preventDefault(); seekBy(5); }
                   if (event.key === 'ArrowLeft') { event.preventDefault(); seekBy(-5); }
                 }}
               >
-                {progressiveIncomplete && mediaDuration ? (
+                {timelineHoverTime !== null ? (
                   <span
-                    className="generated-range"
-                    style={{ width: `${Math.min(100, (playableThrough / mediaDuration) * 100)}%` }}
+                    className="timeline-hover-time"
+                    style={{
+                      left: `${clamp((timelineHoverTime / Math.max(1, mediaDuration)) * 100, 3, 97)}%`,
+                    }}
+                    aria-hidden="true"
+                  >
+                    {clockShort(timelineHoverTime)}
+                  </span>
+                ) : null}
+                {progressiveIncomplete && mediaDuration ? generatedRanges.map((range, index) => (
+                  <span
+                    key={`${range.start}-${range.end}-${index}`}
+                    className={`generated-range${progressiveJob?.sourceOnlyPlayback ? ' source-only' : ''}`}
+                    style={{
+                      left: `${Math.min(100, (range.start / mediaDuration) * 100)}%`,
+                      width: `${Math.min(100, ((range.end - range.start) / mediaDuration) * 100)}%`,
+                    }}
                     aria-hidden="true"
                   />
-                ) : null}
+                )) : null}
+                {progressiveIncomplete && progressiveJob?.sourceOnlyPlayback && mediaDuration
+                  ? translatedRanges.map((range, index) => (
+                    <span
+                      key={`translated-${range.start}-${range.end}-${index}`}
+                      className="generated-range translated-range"
+                      style={{
+                        left: `${Math.min(100, (range.start / mediaDuration) * 100)}%`,
+                        width: `${Math.min(100, ((range.end - range.start) / mediaDuration) * 100)}%`,
+                      }}
+                      aria-hidden="true"
+                    />
+                  ))
+                  : null}
                 <div style={{ width: `${mediaDuration ? Math.min(100, (playbackTime / mediaDuration) * 100) : 0}%` }} />
-                <span className="seek-handle" style={{ left: `${mediaDuration ? Math.min(100, (playbackTime / mediaDuration) * 100) : 0}%` }} aria-hidden="true" />
+                <span
+                  className={`seek-handle${pendingPrioritySeek ? ' pending' : ''}`}
+                  style={{ left: `${mediaDuration ? Math.min(100, (playbackTime / mediaDuration) * 100) : 0}%` }}
+                  aria-hidden="true"
+                />
               </div>
               <span className="timecode">{clockShort(playbackTime)} / {clockShort(mediaDuration)}</span>
               <button
@@ -3131,6 +3837,15 @@ export default function Home() {
               <label className="toggle-row single">
                 <input type="checkbox" checked={cacheEnabled} onChange={() => setCacheEnabled((value) => !value)} />
                 <span><strong>Content-hash cache</strong><small>Skip repeated translations and completed jobs.</small></span>
+              </label>
+              <label className="toggle-row single">
+                <input
+                  type="checkbox"
+                  checked={allowSourceOnlyPlayback}
+                  disabled={transcribing}
+                  onChange={() => setAllowSourceOnlyPlayback((value) => !value)}
+                />
+                <span><strong>原文字幕先行</strong><small>网络慢时先播放 Whisper 原文，中文翻译完成后自动补上。</small></span>
               </label>
               <div className="performance-note">
                 <FastForward size={16} />
@@ -3626,6 +4341,15 @@ export default function Home() {
                   <label className="toggle-row single">
                     <input type="checkbox" checked={cacheEnabled} onChange={() => setCacheEnabled((value) => !value)} />
                     <span><strong>Content-hash cache</strong><small>Skip repeated translations and completed jobs.</small></span>
+                  </label>
+                  <label className="toggle-row single">
+                    <input
+                      type="checkbox"
+                      checked={allowSourceOnlyPlayback}
+                      disabled={transcribing}
+                      onChange={() => setAllowSourceOnlyPlayback((value) => !value)}
+                    />
+                    <span><strong>原文字幕先行</strong><small>网络慢时先开放 Whisper 原文，中文翻译会在后台原位补全。</small></span>
                   </label>
                   <div className="performance-note">
                     <FastForward size={16} />

@@ -68,6 +68,7 @@ async function transcribeWithLocalEngine(file, {
   mediaPath,
   samplePath,
   progressive,
+  resumeFromSeconds,
   signal,
   onProgress,
   onSegment,
@@ -86,7 +87,7 @@ async function transcribeWithLocalEngine(file, {
     request = fetch('/api/transcribe', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: mediaPath, samplePath, language: lang, quality, stream: progressive }),
+      body: JSON.stringify({ path: mediaPath, samplePath, language: lang, quality, stream: progressive, resumeFromSeconds }),
       signal,
     });
   } else if (file) {
@@ -96,6 +97,7 @@ async function transcribeWithLocalEngine(file, {
     form.append('language', lang);
     form.append('quality', quality);
     if (progressive) form.append('stream', '1');
+    if (resumeFromSeconds) form.append('resumeFromSeconds', String(resumeFromSeconds));
     request = fetch('/api/transcribe', { method: 'POST', body: form, signal });
   } else {
     throw new Error('No media file or sample path was provided for local transcription.');
@@ -156,6 +158,10 @@ async function transcribeWithLocalEngine(file, {
     logPath: data.logPath || null,
     status: data.status || null,
     job: data.job || null,
+    durationSeconds: Number(data.durationSeconds) || 0,
+    segmentSeconds: Number(data.segmentSeconds) || 0,
+    firstSegmentSeconds: Number(data.firstSegmentSeconds) || 0,
+    totalSegments: Number(data.totalSegments) || 0,
   };
 }
 
@@ -178,6 +184,7 @@ export async function transcribeVideo(file, options = {}) {
     mediaPath = '',
     samplePath = '',
     progressive = false,
+    resumeFromSeconds = 0,
     signal,
     onProgress,
     onSegment,
@@ -197,6 +204,7 @@ export async function transcribeVideo(file, options = {}) {
     mediaPath,
     samplePath,
     progressive,
+    resumeFromSeconds,
     signal,
     onProgress,
     onSegment,
