@@ -1,3 +1,5 @@
+import { splitTranslationItems } from './translation-batch.js';
+
 export const STREAM_TRANSLATION_BATCH_SIZE = 8;
 export const MIN_SAFETY_BUFFER_SECONDS = 2 * 60;
 export const MAX_SAFETY_BUFFER_SECONDS = 8 * 60;
@@ -79,17 +81,11 @@ function bounded(value, min, max) {
 }
 
 export function progressiveTranslationConcurrency(configuredConcurrency = 2) {
-  return Math.max(1, Math.min(2, Math.floor(Number(configuredConcurrency) || 2)));
+  return Math.max(1, Math.min(3, Math.floor(Number(configuredConcurrency) || 2)));
 }
 
-export function splitTranslationBatches(cues, batchSize = STREAM_TRANSLATION_BATCH_SIZE) {
-  const list = Array.isArray(cues) ? cues : [];
-  const size = Math.max(1, Math.floor(Number(batchSize) || STREAM_TRANSLATION_BATCH_SIZE));
-  const batches = [];
-  for (let index = 0; index < list.length; index += size) {
-    batches.push(list.slice(index, index + size));
-  }
-  return batches;
+export function splitTranslationBatches(cues, batchSize = STREAM_TRANSLATION_BATCH_SIZE, characterBudget = 6000) {
+  return splitTranslationItems(cues, batchSize, characterBudget);
 }
 
 export function selectPrioritySegmentIndex(queue, {

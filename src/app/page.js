@@ -28,6 +28,8 @@ import {
   FileJson,
   FileText,
   Film,
+  FolderCog,
+  FolderOpen,
   Gauge,
   Languages,
   ListChecks,
@@ -51,6 +53,7 @@ import {
 } from 'lucide-react';
 
 const APP_NAME = 'LingoLoop';
+const TRANSLATION_CACHE_DIRECTORY_KEY = 'lingoloop_translation_cache_directory';
 
 const DEMO_CUES = [
   {
@@ -305,6 +308,14 @@ function clockShort(value) {
   return hours
     ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
     : `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function formatBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 // ---- "Continue watching" memory ------------------------------------------
@@ -923,9 +934,13 @@ export default function Home() {
   const [focusView] = useState(false);
   const [panelTab, setPanelTab] = useState('queue');
   const [muted, setMuted] = useState(false);
-  const [batchSize, setBatchSize] = useState(50);
+  const [batchSize, setBatchSize] = useState(20);
   const [concurrency, setConcurrency] = useState(2);
   const [cacheEnabled, setCacheEnabled] = useState(true);
+  const [translationCacheDirectory, setTranslationCacheDirectory] = useState('');
+  const [translationCacheStatus, setTranslationCacheStatus] = useState(null);
+  const [translationCacheNotice, setTranslationCacheNotice] = useState('');
+  const [desktopCacheControlsAvailable, setDesktopCacheControlsAvailable] = useState(false);
   const [allowSourceOnlyPlayback, setAllowSourceOnlyPlayback] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackTime, setPlaybackTime] = useState(0);
@@ -948,6 +963,7 @@ export default function Home() {
   const [statusMessage, setStatusMessage] = useState('Ready. Import media, sidecar subtitles, or a batch manifest.');
   const [translationDone, setTranslationDone] = useState(true);
   const [translationRunning, setTranslationRunning] = useState(false);
+  const [adaptiveTranslationConcurrency, setAdaptiveTranslationConcurrency] = useState(2);
   const [queue, setQueue] = useState(() => [
     makeQueueItem('/videos/lecture01.mp4', 0, { quality: 'balanced', output: ['srt-dual', 'ass-dual'] }),
     makeQueueItem('/videos/interview.mkv', 1, { quality: 'best', targets: ['en', 'zh'], cleanup: qualityPresets.best.cleanup }),
@@ -1012,6 +1028,96 @@ export default function Home() {
     return unavailable;
   }, [quality]);
 
+  const refreshTranslationCacheStatus = useCallback(async (directory = translationCacheDirectory) => {
+    try {
+      const query = directory ? `?directory=${encodeURIComponent(directory)}` : '';
+      const response = await fetch(`/api/translate/cache${query}`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'The translation cache directory is unavailable.');
+      setTranslationCacheStatus({ ...data, available: true, error: null });
+      return data;
+    } catch (error) {
+      setTranslationCacheStatus({
+        directory: directory || '~/.lingoloop/cache/translations',
+        entries: 0,
+        bytes: 0,
+        available: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }, [translationCacheDirectory]);
+
+  const chooseTranslationCacheDirectory = async () => {
+    try {
+      const ipcRenderer = window.require?.('electron')?.ipcRenderer;
+      if (!ipcRenderer) throw new Error('Choosing a server cache directory is available in the desktop app.');
+      const directory = await ipcRenderer.invoke('choose-translation-cache-directory');
+      if (!directory) {
+        setTranslationCacheNotice('Directory selection cancelled; the current cache directory was not changed.');
+        return;
+      }
+      const status = await refreshTranslationCacheStatus(directory);
+      if (!status) return;
+      window.localStorage.setItem(TRANSLATION_CACHE_DIRECTORY_KEY, directory);
+      setTranslationCacheDirectory(directory);
+      const message = `Translation cache directory changed to ${directory}.`;
+      setTranslationCacheNotice(message);
+      setStatusMessage(message);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setTranslationCacheNotice(message);
+      setStatusMessage(message);
+    }
+  };
+
+  const restoreDefaultTranslationCacheDirectory = async () => {
+    window.localStorage.removeItem(TRANSLATION_CACHE_DIRECTORY_KEY);
+    setTranslationCacheDirectory('');
+    const status = await refreshTranslationCacheStatus('');
+    if (status) {
+      const message = `Translation cache restored to ${status.directory}.`;
+      setTranslationCacheNotice(message);
+      setStatusMessage(message);
+    } else {
+      setTranslationCacheNotice('The default translation cache directory is unavailable.');
+    }
+  };
+
+  const openTranslationCacheDirectory = async () => {
+    try {
+      const directory = translationCacheStatus?.directory;
+      const ipcRenderer = window.require?.('electron')?.ipcRenderer;
+      if (!directory || !ipcRenderer) throw new Error('The cache directory can only be opened from the desktop app.');
+      await ipcRenderer.invoke('open-translation-cache-directory', directory);
+      setTranslationCacheNotice(`Opened ${directory}.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setTranslationCacheNotice(message);
+      setStatusMessage(message);
+    }
+  };
+
+  const clearTranslationCache = async () => {
+    if (!window.confirm('Clear every persisted translation in the selected cache directory?')) return;
+    try {
+      const query = translationCacheDirectory
+        ? `?directory=${encodeURIComponent(translationCacheDirectory)}`
+        : '';
+      const response = await fetch(`/api/translate/cache${query}`, { method: 'DELETE' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not clear the translation cache.');
+      setTranslationCacheStatus({ ...data, available: true, error: null });
+      const message = 'Persistent translation cache cleared.';
+      setTranslationCacheNotice(message);
+      setStatusMessage(message);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setTranslationCacheNotice(message);
+      setStatusMessage(message);
+    }
+  };
+
   const updateTranscriptionTrace = (id, status, detail) => {
     setTranscriptionTrace((current) => current.map((stage) => (
       stage.id === id ? { ...stage, status, detail: detail || stage.detail } : stage
@@ -1042,6 +1148,26 @@ export default function Home() {
       // A malformed session log should never affect the player.
     }
   }, []);
+
+  useEffect(() => {
+    try {
+      setDesktopCacheControlsAvailable(Boolean(window.require?.('electron')?.ipcRenderer));
+    } catch {
+      setDesktopCacheControlsAvailable(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const savedDirectory = window.localStorage.getItem(TRANSLATION_CACHE_DIRECTORY_KEY) || '';
+    setTranslationCacheDirectory(savedDirectory);
+    refreshTranslationCacheStatus(savedDirectory);
+  }, [refreshTranslationCacheStatus]);
+
+  useEffect(() => {
+    if (settingsOpen && settingsTab === 'advanced') {
+      refreshTranslationCacheStatus(translationCacheDirectory);
+    }
+  }, [refreshTranslationCacheStatus, settingsOpen, settingsTab, translationCacheDirectory]);
 
   // Object URLs are owned by library items (they must stay alive so the user
   // can switch videos at any time). Revoke them all when the app unmounts.
@@ -1919,7 +2045,7 @@ export default function Home() {
               duration: segment.durationSeconds || duration,
               percent: sourceProgress,
               stage: `原文已生成至 ${clockShort(sourceProcessedThrough)}，中文翻译正在追赶`,
-              translationConcurrency: progressiveTranslationConcurrency(concurrency),
+              translationConcurrency: adaptiveTranslationConcurrency,
               sourceCues: streamedSourceCues,
               translatedCues: streamedTranslatedCues,
               detectedLanguage: segmentDetected || null,
@@ -1968,14 +2094,22 @@ export default function Home() {
             completedTranslationSegments.add(segment.index);
             return;
           }
-          const translationBatches = splitTranslationBatches(enrichedSegment);
+          const configuredTranslationBatchSize = Math.max(1, Math.min(40, Number(batchSize) || 20));
+          const translationBatches = splitTranslationBatches(
+            enrichedSegment,
+            configuredTranslationBatchSize,
+            6000,
+          );
           let translatedInSegment = 0;
           let nextBatchIndex = 0;
           const runNextBatch = async () => {
             if (processingCancelRef.current || nextBatchIndex >= translationBatches.length) return;
             setTranslationRunning(true);
             const batchIndex = nextBatchIndex;
-            const batch = translationBatches[batchIndex];
+            const translationWorkers = progressiveTranslationConcurrency(concurrency);
+            const batchGroup = translationBatches.slice(batchIndex, batchIndex + translationWorkers);
+            const batch = batchGroup.flat();
+            const lastBatchIndex = batchIndex + batchGroup.length - 1;
             const batchOffset = translatedInSegment;
             const translatedBatch = await translateList(
               batch,
@@ -1990,9 +2124,10 @@ export default function Home() {
               () => processingCancelRef.current,
               {
                 maxAttempts: 2,
-                timeoutMs: 20_000,
+                timeoutMs: 45_000,
                 recoverFailures: false,
-                maxWorkers: progressiveTranslationConcurrency(concurrency),
+                batchSize: configuredTranslationBatchSize,
+                maxWorkers: translationWorkers,
               },
             );
             if (processingCancelRef.current) return;
@@ -2003,7 +2138,7 @@ export default function Home() {
               ...streamedTranslatedCues,
               ...translatedBatch,
             ]);
-            const segmentComplete = batchIndex === translationBatches.length - 1;
+            const segmentComplete = lastBatchIndex === translationBatches.length - 1;
             const lastBatchCue = translatedBatch[translatedBatch.length - 1];
             const batchGeneratedThrough = segmentComplete
               ? segment.end
@@ -2065,7 +2200,7 @@ export default function Home() {
               startupMode: currentStartup?.mode || 'pending',
               queuedSegments: pendingTranslationSegments.length,
               prioritySegment: segment.index + 1,
-              translationConcurrency: progressiveTranslationConcurrency(concurrency),
+              translationConcurrency: adaptiveTranslationConcurrency,
               sourceCues: streamedSourceCues,
               translatedCues: streamedTranslatedCues,
               detectedLanguage: segmentDetected || null,
@@ -2139,7 +2274,7 @@ export default function Home() {
                 progressiveJob: nextProgressiveJob,
               });
             }
-            nextBatchIndex += 1;
+            nextBatchIndex += batchGroup.length;
             setTranslationRunning(false);
             if (nextBatchIndex < translationBatches.length && !processingCancelRef.current) {
               enqueueSegmentTranslation(segment, runNextBatch);
@@ -2914,18 +3049,19 @@ export default function Home() {
     const timeoutMs = Math.max(5000, Number(options.timeoutMs) || TRANSLATION_TIMEOUT_MS);
     const recoverFailures = options.recoverFailures !== false;
     const requestedWorkers = options.maxWorkers ?? concurrency;
-    const translateOne = async (cue) => {
+    const requestedBatchSize = Math.max(1, Math.min(40, Number(options.batchSize ?? batchSize) || 20));
+    const requestBatch = async (cueBatch) => {
       const translationContext = {
-        cueId: cue.id,
+        cueIds: cueBatch.map((cue) => cue.id),
+        size: cueBatch.length,
         from: effectiveSource,
         to: target,
-        original: cue.original,
       };
       let lastFailure = 'Translation failed for an unknown reason.';
       let retryAfterMs = 0;
 
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-        if (shouldCancel()) return cue;
+        if (shouldCancel()) return cueBatch;
         const controller = new AbortController();
         translationAbortControllersRef.current.add(controller);
         const timeout = window.setTimeout(
@@ -2945,20 +3081,28 @@ export default function Home() {
             headers: { 'Content-Type': 'application/json' },
             signal: controller.signal,
             body: JSON.stringify({
-              text: cue.original,
+              items: cueBatch.map((cue) => ({ id: cue.id, text: cue.original })),
               from: effectiveSource,
               to: target,
               llmModel: 'none',
               useCache: cacheEnabled,
+              cacheDirectory: translationCacheDirectory || null,
             }),
           });
 
           if (response.ok) {
             const data = await response.json();
-            const translatedText = typeof data.text === 'string' ? data.text.trim() : '';
-            if (!translatedText) {
-              lastFailure = 'The translation API returned an empty result.';
-              console.warn('[Translation] Empty response; cue will be retried', {
+            if (Number.isFinite(Number(data.pool?.concurrency))) {
+              setAdaptiveTranslationConcurrency(Number(data.pool.concurrency));
+            }
+            const translatedById = new Map(
+              (Array.isArray(data.items) ? data.items : [])
+                .map((item) => [String(item.id), typeof item.text === 'string' ? item.text.trim() : '']),
+            );
+            const aligned = cueBatch.map((cue) => translatedById.get(String(cue.id)) || '');
+            if (aligned.some((text) => !text) || translatedById.size !== cueBatch.length) {
+              lastFailure = 'The translation API returned a misaligned or incomplete batch.';
+              console.warn('[Translation] Misaligned batch response; batch will be retried', {
                 ...translationContext,
                 attempt,
                 status: response.status,
@@ -2966,29 +3110,18 @@ export default function Home() {
               });
               continue;
             }
-
-            const unchanged = translatedText === cue.original.trim();
-            if (unchanged) {
-              console.warn('[Translation] Warning: API returned text identical to the original', {
-                ...translationContext,
-                attempt,
-                status: response.status,
-                translated: translatedText,
-              });
-            } else {
-              console.log('[Translation] Success', {
-                ...translationContext,
-                attempt,
-                status: response.status,
-                translated: translatedText,
-              });
-            }
-            return {
+            console.log('[Translation] Batch success', {
+              ...translationContext,
+              attempt,
+              status: response.status,
+              adaptiveConcurrency: data.pool?.concurrency || null,
+            });
+            return cueBatch.map((cue, index) => ({
               ...cue,
-              translation: translatedText,
+              translation: aligned[index],
               translationError: null,
               translationPending: false,
-            };
+            }));
           }
 
           const errorBody = await response.text().catch(() => '');
@@ -2998,13 +3131,16 @@ export default function Home() {
           } catch {
             // Keep the raw response for diagnostics.
           }
+          if (Number.isFinite(Number(errorData?.pool?.concurrency))) {
+            setAdaptiveTranslationConcurrency(Number(errorData.pool.concurrency));
+          }
           retryAfterMs = response.status === 429
             ? Math.max(1000, Number(errorData?.retryAfterMs) || Number(response.headers.get('Retry-After')) * 1000 || 8000)
             : response.status >= 500
               ? 1200 * attempt
               : 600;
           lastFailure = `Translation API returned HTTP ${response.status}${errorBody ? `: ${errorBody}` : ''}`;
-          console.warn('[Translation] Request failed; cue will be retried when eligible', {
+          console.warn('[Translation] Request failed; batch will be retried when eligible', {
             ...translationContext,
             attempt,
             status: response.status,
@@ -3015,7 +3151,7 @@ export default function Home() {
           lastFailure = aborted
             ? `Translation timed out after ${timeoutMs / 1000} seconds.`
             : (error instanceof Error ? error.message : String(error));
-          console.warn('[Translation] Request exception; cue will be retried', {
+          console.warn('[Translation] Request exception; batch will be retried', {
             ...translationContext,
             attempt,
             error: lastFailure,
@@ -3027,7 +3163,7 @@ export default function Home() {
         }
 
         if (attempt < maxAttempts) {
-          console.warn('[Translation] Retrying failed cue', {
+          console.warn('[Translation] Retrying failed batch', {
             ...translationContext,
             nextAttempt: attempt + 1,
             reason: lastFailure,
@@ -3039,34 +3175,40 @@ export default function Home() {
         }
       }
 
-      console.warn('[Translation] Cue still failed after this pass', {
+      console.warn('[Translation] Batch still failed after this pass', {
         ...translationContext,
         attempts: maxAttempts,
         error: lastFailure,
       });
-      return {
+      return cueBatch.map((cue) => ({
         ...cue,
         translation: cue.translation || cue.original,
         translationError: lastFailure,
         translationPending: false,
-      };
+      }));
     };
 
-    // Bounded worker pool: honours the Concurrency setting instead of firing
-    // every cue at once (which rate-limited the translator on long videos).
-    const maxWorkers = Math.max(1, Math.min(12, Number(requestedWorkers) || 2));
+    // The client feeds real batches to the server. The server owns the global
+    // adaptive pool, so every video and retry shares the same 429-aware limit.
+    const batches = splitTranslationBatches(list, requestedBatchSize, 6000);
+    const maxWorkers = Math.max(1, Math.min(3, Number(requestedWorkers) || 2));
     const results = new Array(list.length);
-    let nextIndex = 0;
+    const cueIndexes = new Map(list.map((cue, index) => [String(cue.id), index]));
+    let nextBatchIndex = 0;
     let completedCount = 0;
     const worker = async () => {
-      while (!shouldCancel() && nextIndex < list.length) {
-        const index = nextIndex++;
-        results[index] = await translateOne(list[index]);
-        completedCount += 1;
+      while (!shouldCancel() && nextBatchIndex < batches.length) {
+        const currentBatch = batches[nextBatchIndex++];
+        const translatedBatch = await requestBatch(currentBatch);
+        translatedBatch.forEach((cue) => {
+          const index = cueIndexes.get(String(cue.id));
+          if (index !== undefined) results[index] = cue;
+        });
+        completedCount += currentBatch.length;
         onProgress?.(completedCount, list.length);
       }
     };
-    await Promise.all(Array.from({ length: Math.min(maxWorkers, list.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(maxWorkers, batches.length) }, worker));
 
     // A large batch can still contain a few transient failures after its
     // concurrent pass. Retry only those cues, one at a time, after a short
@@ -3089,7 +3231,8 @@ export default function Home() {
           results.length,
           { recovering: true, current: recoveryIndex + 1, total: initiallyFailedIndexes.length },
         );
-        results[cueIndex] = await translateOne(results[cueIndex]);
+        const [recoveredCue] = await requestBatch([results[cueIndex]]);
+        results[cueIndex] = recoveredCue;
       }
     }
 
@@ -3119,7 +3262,7 @@ export default function Home() {
     if (!cues.length || transcribing || processing || translationRunning) return;
     videoRef.current?.pause();
     setIsPlaying(false);
-    setStatusMessage(`Batch translating ${cues.length} cues from ${sourceLangLabel(effectiveSource)} to ${languageLabel(jobTargetLang)} with concurrency ${concurrency}.`);
+    setStatusMessage(`Batch translating ${cues.length} cues from ${sourceLangLabel(effectiveSource)} to ${languageLabel(jobTargetLang)} with adaptive concurrency ${adaptiveTranslationConcurrency} (range 1–3).`);
     setTranslationDone(false);
     setTranslationRunning(true);
     processingCancelRef.current = false;
@@ -3530,7 +3673,7 @@ export default function Home() {
                 <div className="progressive-playback-status" role="status" aria-live="polite">
                   <span>
                     {pendingPrioritySeek
-                      ? `正在优先生成 ${clockShort(pendingPrioritySeek.time)} 附近及之后的字幕；当前翻译并发 ${progressiveJob.translationConcurrency || 2}`
+                      ? `正在优先生成 ${clockShort(pendingPrioritySeek.time)} 附近及之后的字幕；当前自适应翻译并发 ${adaptiveTranslationConcurrency}`
                       : progressiveJob.active
                       ? `已生成至 ${clockShort(progressiveJob.processedThrough)}，前方缓冲 ${clockShort(bufferAheadSeconds)}${progressiveBufferLow ? '（缓冲偏低）' : ''}；${progressiveJob.stage}`
                       : progressiveJob.paused
@@ -3831,7 +3974,7 @@ export default function Home() {
             <section className="config-panel">
               <div className="panel-heading"><Gauge size={17} /><span>Performance</span></div>
               <div className="metric-grid">
-                <label><span>Batch size</span><input type="number" min="5" max="100" value={batchSize} onChange={(event) => setBatchSize(Number(event.target.value) || 50)} /></label>
+                <label><span>Batch size</span><input type="number" min="1" max="40" value={batchSize} onChange={(event) => setBatchSize(Math.max(1, Math.min(40, Number(event.target.value) || 20)))} /></label>
                 <label><span>Concurrency</span><input type="number" min="1" max="12" value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value) || 1)} /></label>
               </div>
               <label className="toggle-row single">
@@ -4322,7 +4465,7 @@ export default function Home() {
               {settingsTab === 'batch' ? (
                 <section className="settings-section">
                   <div className="metric-grid">
-                    <label><span>Batch size</span><input type="number" min="5" max="100" value={batchSize} onChange={(event) => setBatchSize(Number(event.target.value) || 50)} /></label>
+                    <label><span>Batch size</span><input type="number" min="1" max="40" value={batchSize} onChange={(event) => setBatchSize(Math.max(1, Math.min(40, Number(event.target.value) || 20)))} /></label>
                     <label><span>Concurrency</span><input type="number" min="1" max="12" value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value) || 1)} /></label>
                   </div>
                   <div className="queue-summary">
@@ -4340,8 +4483,55 @@ export default function Home() {
                 <section className="settings-section">
                   <label className="toggle-row single">
                     <input type="checkbox" checked={cacheEnabled} onChange={() => setCacheEnabled((value) => !value)} />
-                    <span><strong>Content-hash cache</strong><small>Skip repeated translations and completed jobs.</small></span>
+                    <span><strong>Persistent translation cache</strong><small>Skip repeated translations across app restarts.</small></span>
                   </label>
+                  <div className={`cache-directory-card${translationCacheStatus?.available === false ? ' unavailable' : ''}`}>
+                    <div>
+                      <strong>Translation cache directory</strong>
+                      <span>{translationCacheStatus?.directory || translationCacheDirectory || '~/.lingoloop/cache/translations'}</span>
+                      <small>
+                        {translationCacheStatus?.available === false
+                          ? translationCacheStatus.error
+                          : `${translationCacheStatus?.entries || 0} translations · ${formatBytes(translationCacheStatus?.bytes)}`}
+                      </small>
+                    </div>
+                    <div className="cache-directory-actions">
+                      <button
+                        className="secondary-action"
+                        type="button"
+                        disabled={!desktopCacheControlsAvailable}
+                        title={desktopCacheControlsAvailable ? 'Choose a cache directory' : 'Available in the Electron desktop app'}
+                        onClick={chooseTranslationCacheDirectory}
+                      >
+                        <FolderCog size={15} /> Choose directory
+                      </button>
+                      <button className="secondary-action" type="button" onClick={restoreDefaultTranslationCacheDirectory}>
+                        <RotateCcw size={15} /> Use default
+                      </button>
+                      <button
+                        className="secondary-action"
+                        type="button"
+                        disabled={!desktopCacheControlsAvailable || !translationCacheStatus?.available}
+                        title={desktopCacheControlsAvailable ? 'Open the cache directory' : 'Available in the Electron desktop app'}
+                        onClick={openTranslationCacheDirectory}
+                      >
+                        <FolderOpen size={15} /> Open
+                      </button>
+                      <button
+                        className="secondary-action"
+                        type="button"
+                        disabled={!translationCacheStatus?.available || !translationCacheStatus.entries}
+                        onClick={clearTranslationCache}
+                      >
+                        <Trash2 size={15} /> Clear
+                      </button>
+                    </div>
+                    <p className={`cache-directory-notice${translationCacheStatus?.available === false ? ' error' : ''}`} role="status" aria-live="polite">
+                      {translationCacheNotice || (!desktopCacheControlsAvailable
+                        ? 'Choose directory and Open are available in Electron desktop mode. Use default and Clear also work in the browser.'
+                        : 'Desktop directory controls are available.')}
+                    </p>
+                  </div>
                   <label className="toggle-row single">
                     <input
                       type="checkbox"

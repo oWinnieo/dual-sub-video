@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
 const path = require('path');
 const { spawn, execSync } = require('child_process');
 const fs = require('fs');
@@ -134,7 +134,6 @@ function createMainWindow() {
     setTimeout(() => {
       if (mainWindow && mainWindow.webContents.getURL() === '') {
         clearInterval(checkServer);
-        const { dialog } = require('electron');
         dialog.showErrorBox('Startup Error', 'The application server failed to start within 60 seconds.');
       }
     }, 60000);
@@ -192,6 +191,23 @@ app.whenReady().then(async () => {
   createOverlayWindow();
   startWebSocketServer();
   await requestPermissions();
+});
+
+ipcMain.handle('choose-translation-cache-directory', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Choose translation cache directory',
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  return result.canceled ? null : result.filePaths[0] || null;
+});
+
+ipcMain.handle('open-translation-cache-directory', async (_event, directory) => {
+  if (typeof directory !== 'string' || !path.isAbsolute(directory)) {
+    throw new Error('A valid translation cache directory is required.');
+  }
+  const errorMessage = await shell.openPath(directory);
+  if (errorMessage) throw new Error(errorMessage);
+  return true;
 });
 
 // --- SATELLITE HANDLERS ---

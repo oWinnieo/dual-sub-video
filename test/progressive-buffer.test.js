@@ -77,10 +77,10 @@ test('splits translation cues into small ordered batches', () => {
   assert.deepEqual(batches.flat().map((cue) => cue.id), cues.map((cue) => cue.id));
 });
 
-test('caps progressive translation concurrency at two workers', () => {
+test('caps progressive translation concurrency at three workers', () => {
   assert.equal(progressiveTranslationConcurrency(1), 1);
   assert.equal(progressiveTranslationConcurrency(2), 2);
-  assert.equal(progressiveTranslationConcurrency(12), 2);
+  assert.equal(progressiveTranslationConcurrency(12), 3);
 });
 
 test('uses the minimum startup buffer when generation keeps up with playback', () => {

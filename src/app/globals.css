@@ -2318,6 +2318,63 @@ select:focus-visible {
   font-weight: 700;
 }
 
+.cache-directory-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--tint-1);
+}
+
+.cache-directory-card.unavailable {
+  border-color: rgba(255, 207, 112, 0.28);
+  background: rgba(255, 207, 112, 0.07);
+}
+
+.cache-directory-card strong,
+.cache-directory-card span,
+.cache-directory-card small {
+  display: block;
+}
+
+.cache-directory-card span {
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 0.75rem;
+}
+
+.cache-directory-card small {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 0.7rem;
+  line-height: 1.4;
+}
+
+.cache-directory-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.cache-directory-actions .secondary-action {
+  width: 100%;
+  min-width: 0;
+  white-space: normal;
+}
+
+.cache-directory-notice {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.7rem;
+  line-height: 1.45;
+}
+
+.cache-directory-notice.error {
+  color: var(--amber);
+}
+
 .settings-note {
   margin: 0;
   color: var(--muted);
