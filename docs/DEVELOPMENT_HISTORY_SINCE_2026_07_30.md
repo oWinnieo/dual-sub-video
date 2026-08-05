@@ -2,17 +2,17 @@
 
 > 更新日期：2026-08-05
 > 仓库：`dual-sub-video`
-> 统计范围：本地克隆基线 `a95b903` 之后，至当前 `HEAD`（`e6cbcc15f02fd504e652dc5060018d153f202cd3`）的所有可达提交。
+> 统计范围：本地克隆基线 `a95b903` 之后，至功能提交 `64cbea84e6a7eac04433672be889d44f489d86de` 的所有可达提交；后续文档维护提交仅用于补录该提交。
 
 ## 1. 结论摘要
 
 - 本项目于 **2026-07-30 20:08:20 +0800** 从 `https://github.com/Dankcode/dual-sub-video.git` 克隆到本机。
 - 克隆时的基线提交是 `a95b903`，该提交本身的提交日期为 2026-07-13，不计入本地 7 月 30 日之后的开发提交。
 - 第一条本地功能提交产生于 **2026-07-30 22:47:13 +0800**。
-- 从克隆基线到当前 `HEAD` 共有 **10 个提交**：
-  - 7 个功能提交；
+- 从克隆基线到统计截止提交共有 **11 个提交**：
+  - 8 个功能提交；
   - 3 个纯合并提交。
-- 当前 `HEAD` 相对克隆基线的最终净变化为：**21 个文件、增加 5,766 行、删除 546 行**。
+- 统计截止提交相对克隆基线的最终净变化为：**28 个文件、增加 6,442 行、删除 559 行**。
 - 原先记录为尚未提交的“批量翻译、自适应限流、持久化缓存”改动，已经由 `e6cbcc15f02fd504e652dc5060018d153f202cd3` 正式提交。
 - 接下来的重点优化方向是提升大文件、长视频的字幕生成速度：
   - 推理链路计划从 Whisper 模型迁移到 `whisper.cpp` 原生 C/C++ 程序，并以独立子进程运行，使高负载转写与界面、翻译等任务解耦。
@@ -34,6 +34,7 @@
 | 2026-08-02 20:34 | `8cda329` | 功能 | Add progressive subtitle generation |
 | 2026-08-04 00:43 | `2a44a10` | 功能 | Improve progressive subtitle generation |
 | 2026-08-04 20:04 | `e6cbcc1` | 功能 | Improve translation batching and persistent cache |
+| 2026-08-05 15:28 | `64cbea8` | 功能 | Improve media library workflow and sample testing |
 
 ## 3. 每个 Commit 的具体改动
 
@@ -378,34 +379,74 @@
 | `test/translation-cache.test.js` | 持久化缓存测试 |
 | `yarn.lock` | 依赖锁文件更新 |
 
-## 4. 从克隆基线到当前 HEAD 的最终净变化
+### 3.11 `64cbea84e6a7eac04433672be889d44f489d86de` — Improve media library workflow and sample testing
 
-这里统计的是 `a95b903..e6cbcc15f02fd504e652dc5060018d153f202cd3` 的最终文件差异，不重复计算分支合并。
+- 时间：2026-08-05 15:28:51 +0800
+- 父提交：`e6cbcc15f02fd504e652dc5060018d153f202cd3`
+- 规模：10 个文件，增加 751 行，删除 88 行
+
+主要目标是完善媒体库导入与后台任务交互，统一长视频字幕生成过程中的界面反馈，并加入可以随应用分发的本地转写测试样例。
+
+具体改动：
+
+- 新增媒体身份识别逻辑：桌面端优先按规范化绝对路径识别同一媒体，浏览器端按文件名、大小和最后修改时间识别重复文件；同一批选择中的重复项目也会被跳过。
+- 媒体库增加独立的“添加视频”入口，避免从媒体库添加文件后自动切换当前播放项目；重复导入时显示明确提示。
+- 点击正在处理的媒体库项目时改为展示该任务的生成进度，并允许关闭进度视图后继续后台处理。
+- 统一长视频渐进生成、暂停、恢复、缓冲和优先生成等状态的英文提示与操作文案。
+- 加入基于 whisper.cpp JFK 公共领域语音样例生成的内置 MP4，并补充来源说明和文件存在性测试。
+- 新增媒体重复识别单元测试，并将用量超限错误信息统一为英文。
+- 新增本地开发历史文档，汇总克隆基线之后的提交记录、改动范围和后续优化方向。
+
+涉及文件：
+
+| 文件 | 改动 |
+| --- | --- |
+| `.gitignore` | 允许提交内置样例视频 |
+| `docs/DEVELOPMENT_HISTORY_SINCE_2026_07_30.md` | 新增开发历史、统计口径和后续优化方向 |
+| `public/samples/ATTRIBUTION.md` | 更新 JFK 样例来源与授权说明 |
+| `public/samples/sample.mp4` | 新增内置本地转写测试视频 |
+| `src/app/globals.css` | 重复导入提示和处理进度界面样式 |
+| `src/app/page.js` | 防重复导入、媒体库任务进度交互和生成状态文案 |
+| `src/lib/media-identity.js` | 媒体身份键生成与重复文件分组 |
+| `src/lib/usage-tracker.js` | 用量超限错误文案统一 |
+| `test/media-identity.test.js` | 媒体身份与重复导入测试 |
+| `test/sample-media.test.js` | 内置样例文件存在性测试 |
+
+## 4. 从克隆基线到统计截止提交的最终净变化
+
+这里统计的是 `a95b903..64cbea84e6a7eac04433672be889d44f489d86de` 的最终文件差异，不重复计算分支合并。
 
 | 文件 | 增加 | 删除 | 主要变化 |
 | --- | ---: | ---: | --- |
-| `.gitignore` | 3 | 0 | 忽略本地翻译缓存目录 |
+| `.gitignore` | 4 | 0 | 忽略本地缓存并允许提交内置样例视频 |
+| `docs/DEVELOPMENT_HISTORY_SINCE_2026_07_30.md` | 417 | 0 | 开发历史、统计口径和后续优化方向 |
 | `main/main.js` | 18 | 2 | Electron 缓存目录 IPC |
 | `package.json` | 1 | 0 | 新增测试命令 |
+| `public/samples/ATTRIBUTION.md` | 6 | 4 | 内置样例来源与授权说明 |
+| `public/samples/sample.mp4` | — | — | 内置本地转写测试视频（二进制文件） |
 | `src/app/api/transcribe/route.js` | 135 | 4 | 转写诊断、分段流式接口、恢复参数 |
 | `src/app/api/translate/cache/route.js` | 27 | 0 | 持久化缓存管理 API |
 | `src/app/api/translate/route.js` | 294 | 29 | 翻译重试、批处理、自适应限流和缓存 |
-| `src/app/globals.css` | 706 | 11 | 播放器、媒体库、弹窗、渐进处理和缓存设置 UI |
-| `src/app/page.js` | 2,140 | 212 | 转写翻译主流程、媒体库、渐进播放器和缓存管理 |
+| `src/app/globals.css` | 734 | 11 | 播放器、媒体库、弹窗、渐进处理和缓存设置 UI |
+| `src/app/page.js` | 2,255 | 220 | 转写翻译主流程、媒体库、渐进播放器和缓存管理 |
 | `src/lib/adaptive-request-pool.js` | 137 | 0 | 自适应并发池 |
 | `src/lib/asr-engines.js` | 119 | 12 | 转写流解析和诊断传递 |
 | `src/lib/local-transcription.js` | 828 | 34 | Whisper 可靠性、Smart Auto、空洞恢复和分段识别 |
+| `src/lib/media-identity.js` | 48 | 0 | 媒体身份键与重复导入识别 |
 | `src/lib/progressive-buffer.js` | 213 | 0 | 渐进缓冲和翻译拆批算法 |
 | `src/lib/translation-batch.js` | 86 | 0 | 批次封装与对齐解析 |
 | `src/lib/translation-cache.js` | 145 | 0 | 会话和磁盘翻译缓存 |
+| `src/lib/usage-tracker.js` | 1 | 1 | 用量超限错误文案统一 |
 | `src/lib/whisper-language-detection.js` | 94 | 0 | Whisper 语言 token 检测 |
 | `test/adaptive-request-pool.test.js` | 41 | 0 | 自适应并发测试 |
+| `test/media-identity.test.js` | 48 | 0 | 媒体身份与重复导入测试 |
 | `test/progressive-buffer.test.js` | 171 | 0 | 渐进缓冲测试 |
+| `test/sample-media.test.js` | 12 | 0 | 内置样例文件存在性测试 |
 | `test/translation-batch.test.js` | 46 | 0 | 翻译批次测试 |
 | `test/translation-cache.test.js` | 43 | 0 | 持久化缓存测试 |
 | `test/whisper-language-detection.test.js` | 51 | 0 | 语言检测测试 |
 | `yarn.lock` | 468 | 242 | 依赖解析和平台可选包更新 |
-| **合计** | **5,766** | **546** | **21 个文件** |
+| **合计** | **6,442** | **559** | **28 个文件** |
 
 ## 5. 文档与统计口径说明
 
@@ -413,5 +454,5 @@
 - `README.md` 和 `LINGOLOOP_PLAN.md` 保持当前 Git 提交中的原始版本。
 - 功能提交的“增加/删除行数”来自该 commit 相对其父提交的 Git 统计。
 - 合并提交没有额外冲突解决代码，因此只说明整合作用，不重复计算被合并功能的行数。
-- “最终净变化”来自克隆基线到当前 `HEAD` 的直接 diff，因此会小于各功能提交历史增删行数的简单相加；被后续重写或删除的内容不会出现在最终净变化里。
+- “最终净变化”来自克隆基线到统计截止提交的直接 diff，因此会小于各功能提交历史增删行数的简单相加；被后续重写或删除的内容不会出现在最终净变化里。
 - Git 不记录未提交改动的完整创建历史；只有进入 commit 后，才能作为可核验的历史节点记录。
