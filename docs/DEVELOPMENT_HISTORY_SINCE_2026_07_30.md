@@ -2,17 +2,19 @@
 
 > 更新日期：2026-08-05
 > 仓库：`dual-sub-video`
-> 统计范围：本地克隆基线 `a95b903` 之后，至功能提交 `64cbea84e6a7eac04433672be889d44f489d86de` 的所有可达提交；后续文档维护提交仅用于补录该提交。
+> 统计范围：本地克隆基线 `a95b903` 之后，至工程维护提交 `f080be19b48234ea8a520a7fecbc75ee524b393a` 的所有可达提交；后续文档维护提交仅用于补录该提交。
 
 ## 1. 结论摘要
 
 - 本项目于 **2026-07-30 20:08:20 +0800** 从 `https://github.com/Dankcode/dual-sub-video.git` 克隆到本机。
 - 克隆时的基线提交是 `a95b903`，该提交本身的提交日期为 2026-07-13，不计入本地 7 月 30 日之后的开发提交。
 - 第一条本地功能提交产生于 **2026-07-30 22:47:13 +0800**。
-- 从克隆基线到统计截止提交共有 **11 个提交**：
+- 从克隆基线到统计截止提交共有 **13 个提交**：
   - 8 个功能提交；
-  - 3 个纯合并提交。
-- 统计截止提交相对克隆基线的最终净变化为：**28 个文件、增加 6,442 行、删除 559 行**。
+  - 3 个纯合并提交；
+  - 1 个文档维护提交；
+  - 1 个工程维护提交。
+- 统计截止提交相对克隆基线的最终净变化为：**31 个文件、增加 6,495 行、删除 12,307 行**；其中大部分删除行来自移除重复的 npm 锁文件，不代表业务代码大规模删减。
 - 原先记录为尚未提交的“批量翻译、自适应限流、持久化缓存”改动，已经由 `e6cbcc15f02fd504e652dc5060018d153f202cd3` 正式提交。
 - 接下来的重点优化方向是提升大文件、长视频的字幕生成速度：
   - 推理链路计划从 Whisper 模型迁移到 `whisper.cpp` 原生 C/C++ 程序，并以独立子进程运行，使高负载转写与界面、翻译等任务解耦。
@@ -35,6 +37,8 @@
 | 2026-08-04 00:43 | `2a44a10` | 功能 | Improve progressive subtitle generation |
 | 2026-08-04 20:04 | `e6cbcc1` | 功能 | Improve translation batching and persistent cache |
 | 2026-08-05 15:28 | `64cbea8` | 功能 | Improve media library workflow and sample testing |
+| 2026-08-05 15:32 | `a57fdf8` | 文档 | Document media library workflow commit |
+| 2026-08-05 15:54 | `f080be1` | 工程 | Standardize Node and Yarn tooling |
 
 ## 3. 每个 Commit 的具体改动
 
@@ -412,18 +416,65 @@
 | `test/media-identity.test.js` | 媒体身份与重复导入测试 |
 | `test/sample-media.test.js` | 内置样例文件存在性测试 |
 
+### 3.12 `a57fdf8ace54eb3e461828bed79fe79658d4afe8` — Document media library workflow commit
+
+- 时间：2026-08-05 15:32:17 +0800
+- 父提交：`64cbea84e6a7eac04433672be889d44f489d86de`
+- 规模：1 个文件，增加 52 行，删除 11 行
+- 类型：文档维护提交
+
+该提交把 `64cbea84e6a7eac04433672be889d44f489d86de` 的真实提交信息、媒体库交互改动和最新净变化补录到本文档，并将统计范围固定到该功能提交。
+
+### 3.13 `f080be19b48234ea8a520a7fecbc75ee524b393a` — Standardize Node and Yarn tooling
+
+- 时间：2026-08-05 15:54:49 +0800
+- 父提交：`a57fdf8ace54eb3e461828bed79fe79658d4afe8`
+- 规模：5 个文件，增加 15 行，删除 11,751 行
+- 类型：工程维护提交
+
+主要目标是统一可复现的开发与打包环境，解决 ESLint 因缺少 TypeScript peer dependency 无法启动，以及 Node 20 不满足 `@electron/rebuild@4.0.1` 运行要求的问题。
+
+具体改动：
+
+- 新增 `.nvmrc`，将项目开发环境固定到 Node.js 22；`package.json` 同时声明最低版本为 Node.js 22.12.0。
+- 在 `package.json` 中声明 Yarn 1.22.22 为项目包管理器，并把 TypeScript 5 加入开发依赖；实际锁定版本为 5.9.3。
+- 删除重复的 `package-lock.json`，保留 `yarn.lock` 作为唯一依赖锁文件，避免 npm 与 Yarn 解析结果分叉。
+- 更新 Whisper 兼容脚本中的依赖安装提示，统一使用 `yarn install`。
+- 正式安装和验证不再使用 `--ignore-engines`；该参数只在问题诊断期间临时使用过。
+
+验证结果（Node.js 22.23.2、Yarn 1.22.22）：
+
+- `yarn install --frozen-lockfile`：通过。
+- `yarn test`：29 项测试全部通过。
+- `yarn lint`：通过，原先缺少 TypeScript 导致的启动错误已解决。
+- `yarn build`：通过，Next.js 生产构建成功。
+- `yarn electron:pack`：通过，Apple Silicon 的 `sharp` 原生模块完成重建，并生成未公证的 macOS arm64 应用目录；正式发布仍需单独验证开发者签名和 notarization。
+
+涉及文件：
+
+| 文件 | 改动 |
+| --- | --- |
+| `.nvmrc` | 固定使用 Node.js 22 |
+| `package.json` | 声明 Node/Yarn 版本并增加 TypeScript 开发依赖 |
+| `package-lock.json` | 删除重复的 npm 锁文件 |
+| `scripts/setup-whisper.sh` | 将依赖安装提示统一为 Yarn |
+| `yarn.lock` | 锁定 TypeScript 5.9.3 |
+
 ## 4. 从克隆基线到统计截止提交的最终净变化
 
-这里统计的是 `a95b903..64cbea84e6a7eac04433672be889d44f489d86de` 的最终文件差异，不重复计算分支合并。
+这里统计的是 `a95b903..f080be19b48234ea8a520a7fecbc75ee524b393a` 的最终文件差异，不重复计算分支合并。
 
 | 文件 | 增加 | 删除 | 主要变化 |
 | --- | ---: | ---: | --- |
 | `.gitignore` | 4 | 0 | 忽略本地缓存并允许提交内置样例视频 |
-| `docs/DEVELOPMENT_HISTORY_SINCE_2026_07_30.md` | 417 | 0 | 开发历史、统计口径和后续优化方向 |
+| `.nvmrc` | 1 | 0 | 固定使用 Node.js 22 |
+| `docs/DEVELOPMENT_HISTORY_SINCE_2026_07_30.md` | 458 | 0 | 开发历史、统计口径和后续优化方向 |
 | `main/main.js` | 18 | 2 | Electron 缓存目录 IPC |
-| `package.json` | 1 | 0 | 新增测试命令 |
+| `package-lock.json` | 0 | 11,748 | 删除重复的 npm 锁文件 |
+| `package.json` | 7 | 1 | 测试命令、Node/Yarn 版本和 TypeScript 依赖 |
 | `public/samples/ATTRIBUTION.md` | 6 | 4 | 内置样例来源与授权说明 |
 | `public/samples/sample.mp4` | — | — | 内置本地转写测试视频（二进制文件） |
+| `scripts/setup-whisper.sh` | 3 | 2 | 统一依赖安装提示为 Yarn |
 | `src/app/api/transcribe/route.js` | 135 | 4 | 转写诊断、分段流式接口、恢复参数 |
 | `src/app/api/translate/cache/route.js` | 27 | 0 | 持久化缓存管理 API |
 | `src/app/api/translate/route.js` | 294 | 29 | 翻译重试、批处理、自适应限流和缓存 |
@@ -445,8 +496,8 @@
 | `test/translation-batch.test.js` | 46 | 0 | 翻译批次测试 |
 | `test/translation-cache.test.js` | 43 | 0 | 持久化缓存测试 |
 | `test/whisper-language-detection.test.js` | 51 | 0 | 语言检测测试 |
-| `yarn.lock` | 468 | 242 | 依赖解析和平台可选包更新 |
-| **合计** | **6,442** | **559** | **28 个文件** |
+| `yarn.lock` | 470 | 239 | 依赖解析、平台可选包和 TypeScript 锁定版本 |
+| **合计** | **6,495** | **12,307** | **31 个文件** |
 
 ## 5. 文档与统计口径说明
 
@@ -455,4 +506,5 @@
 - 功能提交的“增加/删除行数”来自该 commit 相对其父提交的 Git 统计。
 - 合并提交没有额外冲突解决代码，因此只说明整合作用，不重复计算被合并功能的行数。
 - “最终净变化”来自克隆基线到统计截止提交的直接 diff，因此会小于各功能提交历史增删行数的简单相加；被后续重写或删除的内容不会出现在最终净变化里。
+- 删除 `package-lock.json` 产生的 11,748 个删除行属于锁文件清理，不代表删除了同等规模的业务代码。
 - Git 不记录未提交改动的完整创建历史；只有进入 commit 后，才能作为可核验的历史节点记录。
