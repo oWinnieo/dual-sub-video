@@ -4,12 +4,13 @@
 #
 # LingoLoop now runs Whisper through the local Node server, so no Xcode,
 # Homebrew, CMake, or whisper-cli installation is needed. FFmpeg/ffprobe are
-# packaged with npm, and the selected model downloads on its first use.
+# installed as project dependencies, and the selected model downloads on its
+# first use.
 
 set -euo pipefail
 
 if [ ! -d "node_modules/ffmpeg-static" ] || [ ! -d "node_modules/@ffprobe-installer/ffprobe" ]; then
-  echo "LingoLoop dependencies are missing. Run: npm install"
+  echo "LingoLoop dependencies are missing. Run: yarn install"
   exit 1
 fi
 
