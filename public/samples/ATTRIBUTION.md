@@ -1,7 +1,9 @@
 # Sample Media Attribution
 
-LingoLoop's planned first-run transcription smoke test is designed for a short excerpt of **Tears of Steel** by Blender Foundation / mango.blender.org, licensed under **CC BY 3.0**.
+`sample.mp4` contains the JFK speech sample distributed by
+[whisper.cpp](https://github.com/ggerganov/whisper.cpp/tree/master/samples), paired
+with a plain generated color frame for LingoLoop's local ASR smoke test.
 
-The binary sample video is intentionally not committed here yet. Place the prepared excerpt at `public/samples/tears-of-steel-smoke.mp4` after verifying the clip boundaries and attribution requirements.
-
-The current setup script can also generate `public/samples/sample.mp4` from whisper.cpp's bundled JFK speech sample. That audio is a public-domain United States Government work; the generated video pairs it with a simple color source only for local ASR smoke testing. Generated media files are ignored by Git.
+The speech is an excerpt from President John F. Kennedy's 1961 inaugural
+address. As a work of the United States Government, it is in the public domain.
+The generated color frame does not contain third-party artwork.

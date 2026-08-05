@@ -2946,6 +2946,34 @@ select:focus-visible {
   text-align: center;
 }
 
+.duplicate-import-notice {
+  position: fixed;
+  top: calc(var(--topbar) + 12px);
+  left: 50%;
+  z-index: 80;
+  width: min(620px, calc(100vw - 32px));
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px 10px 14px;
+  border: 1px solid rgba(255, 207, 112, 0.42);
+  border-radius: var(--radius);
+  color: var(--text);
+  background: rgba(45, 34, 17, 0.96);
+  box-shadow: var(--shadow);
+  transform: translateX(-50%);
+}
+
+.duplicate-import-notice > svg {
+  color: var(--amber);
+}
+
+.duplicate-import-notice > span {
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
 .processing-spinner {
   display: inline-flex;
   align-items: center;
@@ -3001,7 +3029,7 @@ select:focus-visible {
 .processing-long-note {
   display: grid;
   gap: 5px;
-  margin: 0 0 16px;
+  margin: 10px 0 16px;
   padding: 11px 12px;
   border: 1px solid var(--accent-border);
   border-radius: var(--radius);

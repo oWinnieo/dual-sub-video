@@ -28,6 +28,7 @@
 /public/samples/*
 !/public/samples/
 !/public/samples/ATTRIBUTION.md
+!/public/samples/sample.mp4
 
 # stray local build output (safe to delete)
 /tmp/

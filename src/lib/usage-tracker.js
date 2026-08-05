@@ -57,7 +57,7 @@ export function checkAndIncrementUsage(apiKey, additionalSeconds) {
     }
 
     if (usage.keys[key] + additionalSeconds > MAX_DAILY_SECONDS) {
-        const error = new Error('超过每日配额，请修改配额或联系管理员');
+        const error = new Error('Daily quota exceeded. Adjust the quota or contact an administrator.');
         error.status = 403;
         throw error;
     }

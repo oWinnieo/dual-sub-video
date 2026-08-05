@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { transcribeVideo } from '@/lib/asr-engines';
+import { partitionDuplicateMediaFiles } from '@/lib/media-identity';
 import {
   estimateProgressiveBuffer,
   continuousGeneratedThrough,
@@ -865,6 +866,7 @@ function buildJobs(sourceMode, cues, translationDone, translationRunning, queueR
 
 export default function Home() {
   const mediaInputRef = useRef(null);
+  const libraryMediaInputRef = useRef(null);
   const sidecarInputRef = useRef(null);
   const batchInputRef = useRef(null);
   const videoRef = useRef(null);
@@ -891,6 +893,7 @@ export default function Home() {
   const [library, setLibrary] = useState([]);
   const [activeItemId, setActiveItemId] = useState(null);
   const [libraryOpen, setLibraryOpen] = useState(false);
+  const [libraryProgressItemId, setLibraryProgressItemId] = useState(null);
   const [batchRunning, setBatchRunning] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState('subtitles');
@@ -961,6 +964,7 @@ export default function Home() {
   const [savedCards, setSavedCards] = useState([]);
   const [formats, setFormats] = useState({ srt: true, ass: true, json: false, report: true });
   const [statusMessage, setStatusMessage] = useState('Ready. Import media, sidecar subtitles, or a batch manifest.');
+  const [duplicateImportNotice, setDuplicateImportNotice] = useState('');
   const [translationDone, setTranslationDone] = useState(true);
   const [translationRunning, setTranslationRunning] = useState(false);
   const [adaptiveTranslationConcurrency, setAdaptiveTranslationConcurrency] = useState(2);
@@ -1009,6 +1013,16 @@ export default function Home() {
     () => library.filter((item) => !item.cues?.length && item.status !== 'processing').length,
     [library],
   );
+  const libraryProgressItem = useMemo(
+    () => library.find((item) => item.id === libraryProgressItemId) || null,
+    [library, libraryProgressItemId],
+  );
+
+  useEffect(() => {
+    if (libraryProgressItemId && libraryProgressItem?.status !== 'processing') {
+      setLibraryProgressItemId(null);
+    }
+  }, [libraryProgressItem, libraryProgressItemId]);
 
   const refreshTranscriptionStatus = useCallback(async (nextQuality = quality) => {
     try {
@@ -1526,7 +1540,9 @@ export default function Home() {
   };
 
   // Accept one or many dropped/browsed media files into the library.
-  const addFilesToLibrary = (fileList) => {
+  const addFilesToLibrary = (fileList, options = {}) => {
+    const { selectFirst = true } = options;
+    setDuplicateImportNotice('');
     const files = Array.from(fileList || []).filter((file) => (
       file.type?.startsWith('video/')
       || file.type?.startsWith('audio/')
@@ -1536,12 +1552,28 @@ export default function Home() {
       setStatusMessage('Those files were not recognized as video or audio.');
       return;
     }
-    const items = files.map((file, index) => ({
+    const { unique, duplicates } = partitionDuplicateMediaFiles(
+      files,
+      libraryRef.current,
+      getDesktopFilePath,
+    );
+    const duplicateMessage = duplicates.length === 1
+      ? `${duplicates[0].name} is already in Your library and was not added again.`
+      : duplicates.length
+        ? `${duplicates.length} selected videos are already in Your library and were not added again.`
+        : '';
+    if (!unique.length) {
+      setDuplicateImportNotice(duplicateMessage);
+      setStatusMessage(duplicateMessage);
+      return;
+    }
+    const items = unique.map(({ file, path, identityKeys }, index) => ({
       id: `media-${Date.now()}-${index}`,
       name: file.name,
       file,
       url: URL.createObjectURL(file),
-      path: getDesktopFilePath(file),
+      path,
+      identityKeys,
       status: 'new',
       progress: 0,
       stage: '',
@@ -1550,14 +1582,29 @@ export default function Home() {
       error: null,
     }));
     setLibrary((current) => [...current, ...items]);
-    selectLibraryItem(items[0]);
-    setStatusMessage(items.length === 1
-      ? `Added ${items[0].name}. Check the languages below, then press "Create subtitles".`
-      : `Added ${items.length} videos to your library. Transcribe them one by one, or all at once from the library menu.`);
+    const duplicateNote = duplicates.length
+      ? ` ${duplicates.length === 1 ? duplicates[0].name : `${duplicates.length} selected videos`} already ${duplicates.length === 1 ? 'exists' : 'exist'} in Your library and ${duplicates.length === 1 ? 'was' : 'were'} skipped.`
+      : '';
+    if (duplicateMessage) setDuplicateImportNotice(duplicateMessage);
+    if (selectFirst) {
+      selectLibraryItem(items[0]);
+      setStatusMessage(items.length === 1
+        ? `Added ${items[0].name}. Check the languages below, then press "Create subtitles".${duplicateNote}`
+        : `Added ${items.length} videos to your library. Transcribe them one by one, or all at once from the library menu.${duplicateNote}`);
+    } else {
+      setStatusMessage(items.length === 1
+        ? `Added ${items[0].name} to Your library. Use its Create button when you're ready to generate subtitles.${duplicateNote}`
+        : `Added ${items.length} videos to Your library. Use each video's Create button, or choose Subtitle all.${duplicateNote}`);
+    }
   };
 
   const handleMediaImport = (event) => {
     addFilesToLibrary(event.target.files);
+    event.target.value = '';
+  };
+
+  const handleLibraryMediaImport = (event) => {
+    addFilesToLibrary(event.target.files, { selectFirst: false });
     event.target.value = '';
   };
 
@@ -1754,7 +1801,7 @@ export default function Home() {
 
     if (mode === 'immediate') {
       enterProgressivePlayer(
-        `已生成至 ${clockShort(nextStartup.processedThrough)}，可以立即观看；字幕会继续在后台生成。`,
+        `Subtitles are ready through ${clockShort(nextStartup.processedThrough)}. You can start watching now while the rest are generated in the background.`,
       );
       return;
     }
@@ -1762,14 +1809,14 @@ export default function Home() {
     if (nextStartup.processedThrough >= nextStartup.targetBufferSeconds - 0.5) {
       progressiveStartupRef.current = { ...nextStartup, released: true };
       enterProgressivePlayer(
-        `安全缓冲已就绪：已生成 ${clockShort(nextStartup.processedThrough)}，可以开始流畅观看。`,
+        `Your playback buffer is ready. Subtitles are available through ${clockShort(nextStartup.processedThrough)}, so you can start watching smoothly.`,
       );
       return;
     }
 
     setProgressiveStartDecision(nextStartup);
     setProcessingStage(
-      `正在建立安全缓冲 · 已生成 ${clockShort(nextStartup.processedThrough)} / ${clockShort(nextStartup.targetBufferSeconds)}`,
+      `Building playback buffer · ${clockShort(nextStartup.processedThrough)} of ${clockShort(nextStartup.targetBufferSeconds)} ready`,
     );
   };
 
@@ -1822,7 +1869,7 @@ export default function Home() {
       active: true,
       paused: false,
       cancelled: false,
-      stage: `正在从 ${clockShort(resumeJob.resumeFromSeconds || 0)} 继续生成`,
+      stage: `Resuming subtitle generation from ${clockShort(resumeJob.resumeFromSeconds || 0)}`,
     } : null;
     progressiveJobRef.current = resumedActiveJob;
     setProgressiveJob(resumedActiveJob);
@@ -1909,7 +1956,7 @@ export default function Home() {
       playbackTimeRef.current = pendingSeek.time;
       setPlaybackTime(pendingSeek.time);
       setStatusMessage(
-        `${clockShort(pendingSeek.time)} 附近的${jobAllowSourceOnlyPlayback ? '原文' : '双语'}字幕已经生成，可以从这里开始播放。`,
+        `${jobAllowSourceOnlyPlayback ? 'Source' : 'Dual'} subtitles around ${clockShort(pendingSeek.time)} are ready. You can start playing from here.`,
       );
       return true;
     };
@@ -2044,7 +2091,7 @@ export default function Home() {
               sourceOnlyPlayback: true,
               duration: segment.durationSeconds || duration,
               percent: sourceProgress,
-              stage: `原文已生成至 ${clockShort(sourceProcessedThrough)}，中文翻译正在追赶`,
+              stage: `Source subtitles ready through ${clockShort(sourceProcessedThrough)} · translation catching up`,
               translationConcurrency: adaptiveTranslationConcurrency,
               sourceCues: streamedSourceCues,
               translatedCues: streamedTranslatedCues,
@@ -2067,7 +2114,7 @@ export default function Home() {
               progressiveStartupRef.current = { mode: 'source-only', released: true };
               setPlaybackTime(sourceOnlyCues[0]?.start ?? 0);
               setSelectedWord(sourceOnlyCues[0]?.words?.[0] ?? null);
-              enterProgressivePlayer('原文字幕已经可以播放，中文翻译会在后台逐批补上。');
+              enterProgressivePlayer('Source subtitles are ready to watch. Translations will be added in batches in the background.');
             }
             if (jobItemId) {
               updateLibraryItem(jobItemId, {
@@ -2168,14 +2215,14 @@ export default function Home() {
             ));
             const priorityTarget = pendingPrioritySeekRef.current?.time;
             const nextStage = allSegmentsComplete
-              ? '全部分段已生成'
+              ? 'All segments generated'
               : jobAllowSourceOnlyPlayback
-                ? `原文可播放，中文已完成 ${completedSegments}/${segment.totalSegments} 段`
+                ? `Source subtitles playable · ${completedSegments}/${segment.totalSegments} segments translated`
               : Number.isFinite(priorityTarget)
-                ? `正在优先生成 ${clockShort(priorityTarget)} 附近 · 已完成 ${completedSegments}/${segment.totalSegments} 段`
+                ? `Prioritizing subtitles around ${clockShort(priorityTarget)} · ${completedSegments}/${segment.totalSegments} segments complete`
                 : segmentComplete
-                  ? `已完成 ${completedSegments}/${segment.totalSegments} 段，继续生成播放位置之后的字幕`
-                : `第 ${segment.index + 1}/${segment.totalSegments} 段已翻译 ${translatedInSegment}/${enrichedSegment.length} 条`;
+                  ? `${completedSegments}/${segment.totalSegments} segments complete · continuing after the playback position`
+                : `Segment ${segment.index + 1}/${segment.totalSegments} · ${translatedInSegment}/${enrichedSegment.length} cues translated`;
             const currentStartup = progressiveStartupRef.current;
             const nextProgressiveJob = {
               active: !allSegmentsComplete,
@@ -2242,7 +2289,7 @@ export default function Home() {
                 && processedThrough >= updatedStartup.targetBufferSeconds - 0.5) {
                 progressiveStartupRef.current = { ...updatedStartup, released: true };
                 enterProgressivePlayer(
-                  `安全缓冲已就绪：已生成 ${clockShort(processedThrough)}，后台会继续生成剩余字幕。`,
+                  `Your playback buffer is ready through ${clockShort(processedThrough)}. The remaining subtitles will be generated in the background.`,
                 );
               }
             }
@@ -2259,7 +2306,7 @@ export default function Home() {
               };
               progressiveStartupRef.current = startupDecision;
               setProgressiveStartDecision(startupDecision);
-              setProcessingStage('首段双语字幕已生成，请选择观看方式');
+              setProcessingStage('The first dual-subtitle segment is ready. Choose when to start watching.');
             }
 
             if (jobItemId) {
@@ -2393,7 +2440,7 @@ export default function Home() {
           completedSegments: transcribedSegmentCount || current?.totalSegments || current?.completedSegments || 1,
           processedThrough: transcribedDuration || finalCues[finalCues.length - 1]?.end || current?.processedThrough || 0,
           percent: 100,
-          stage: '全部分段已生成',
+          stage: 'All segments generated',
         }));
       }
       if (translationsReady) recordSubtitleLog(finalCues, 'transcribe');
@@ -2413,7 +2460,7 @@ export default function Home() {
             completedSegments: completedProgressiveJob.totalSegments || completedProgressiveJob.completedSegments || 1,
             processedThrough: duration || finalCues[finalCues.length - 1]?.end || completedProgressiveJob.processedThrough || 0,
             percent: 100,
-            stage: '全部分段已生成',
+            stage: 'All segments generated',
           } : null,
         });
       }
@@ -2481,7 +2528,7 @@ export default function Home() {
               ...item,
               status: hasPartialCues ? 'partial' : 'failed',
               progress: hasPartialCues ? item.progress : 0,
-              stage: hasPartialCues ? '后台生成中断' : '生成失败',
+              stage: hasPartialCues ? 'Background generation interrupted' : 'Generation failed',
               error: error.message,
               cues: partialCues.length ? partialCues : item.cues,
             };
@@ -2504,7 +2551,7 @@ export default function Home() {
         const pausedJob = {
           ...progressiveJobRef.current,
           pausing: false,
-          stage: `已暂停，可从 ${clockShort(progressiveJobRef.current.resumeFromSeconds || 0)} 继续生成`,
+          stage: `Paused · generation can resume from ${clockShort(progressiveJobRef.current.resumeFromSeconds || 0)}`,
         };
         progressiveJobRef.current = pausedJob;
         setProgressiveJob(pausedJob);
@@ -2532,7 +2579,7 @@ export default function Home() {
   const closeConfig = () => {
     if (processing || transcribing || translationRunning) return;
     setViewStep('landing');
-    setStatusMessage('配置已关闭。视频仍保留在 Your library，可重新生成或删除。');
+    setStatusMessage('Setup closed. The video remains in Your library, where you can regenerate its subtitles or remove it.');
   };
 
   const pauseProcessing = () => {
@@ -2559,7 +2606,7 @@ export default function Home() {
       cancelled: false,
       resumable: true,
       resumeFromSeconds,
-      stage: `正在暂停，将保留已生成内容并从 ${clockShort(resumeFromSeconds)} 继续`,
+      stage: `Pausing safely · generated subtitles will be kept and can resume from ${clockShort(resumeFromSeconds)}`,
     };
     progressiveJobRef.current = pausedJob;
     setProgressiveJob(pausedJob);
@@ -2573,18 +2620,18 @@ export default function Home() {
     }
     setProcessing(false);
     if (cues.length) setViewStep('player');
-    setStatusMessage(`字幕生成正在安全暂停；已生成内容不会丢失，稍后可从 ${clockShort(resumeFromSeconds)} 继续。`);
+    setStatusMessage(`Subtitle generation is pausing safely. Your progress is saved, and you can resume from ${clockShort(resumeFromSeconds)} later.`);
   };
 
   const resumeProcessing = () => {
     const current = progressiveJobRef.current || progressiveJob;
     if (!current?.resumable || current.pausing || transcribing || translationRunning) return;
     if (!mediaFileRef.current && !mediaPath) {
-      setStatusMessage('原视频当前不可用，请重新选择同一个视频后再继续生成。');
+      setStatusMessage('The original video is unavailable. Select the same video again before resuming subtitle generation.');
       return;
     }
     setProgressNoticeVisible(true);
-    setStatusMessage(`正在从 ${clockShort(current.resumeFromSeconds || 0)} 恢复字幕生成，已有字幕会保留。`);
+    setStatusMessage(`Resuming subtitle generation from ${clockShort(current.resumeFromSeconds || 0)}. Existing subtitles will be kept.`);
     processVideo({
       resumeJob: current,
       sourceLanguage: current.detectedLanguage || current.sourceLanguage || sourceLang,
@@ -2596,7 +2643,7 @@ export default function Home() {
   const cancelProcessing = () => {
     const current = progressiveJobRef.current || progressiveJob;
     if ((current?.active || current?.paused) && current.processedThrough
-      && !window.confirm('确定结束本次后台生成吗？\n\n已生成的字幕会保留，但“结束”后不会显示继续按钮；如果只是暂时不生成，请选择“暂停并保留进度”。')) return;
+      && !window.confirm('Stop background subtitle generation?\n\nGenerated subtitles will be kept, but the Resume button will no longer be available. If you only want to stop temporarily, choose “Pause and save progress” instead.')) return;
     processingCancelRef.current = true;
     transcriptionAbortRef.current?.abort();
     transcriptionAbortRef.current = null;
@@ -2613,14 +2660,14 @@ export default function Home() {
       pausing: false,
       cancelled: true,
       resumable: false,
-      stage: '后台生成已停止',
+      stage: 'Background generation stopped',
     } : null;
     progressiveJobRef.current = cancelledJob;
     setProgressiveJob(cancelledJob);
     if (activeItemIdRef.current) {
       updateLibraryItem(activeItemIdRef.current, {
         status: cancelledJob?.processedThrough ? 'partial' : 'new',
-        stage: cancelledJob?.processedThrough ? '后台生成已停止' : '',
+        stage: cancelledJob?.processedThrough ? 'Background generation stopped' : '',
         progressiveJob: cancelledJob,
       });
     }
@@ -2817,14 +2864,14 @@ export default function Home() {
     && bufferAheadSeconds < Math.min(MIN_SAFETY_BUFFER_SECONDS, targetBufferSeconds),
   );
   const compactProgressState = pendingPrioritySeek
-    ? { kind: 'priority', label: '优先生成' }
+    ? { kind: 'priority', label: 'Prioritizing' }
     : progressiveJob?.active
-      ? { kind: 'active', label: '生成中' }
+      ? { kind: 'active', label: 'Generating' }
       : progressiveJob?.pausing
-        ? { kind: 'pausing', label: '正在暂停' }
+        ? { kind: 'pausing', label: 'Pausing' }
         : progressiveJob?.paused
-          ? { kind: 'paused', label: '已暂停' }
-          : { kind: 'stopped', label: '已停止' };
+          ? { kind: 'paused', label: 'Paused' }
+          : { kind: 'stopped', label: 'Stopped' };
 
   useEffect(() => {
     if (progressNoticeTimerRef.current) window.clearTimeout(progressNoticeTimerRef.current);
@@ -2873,10 +2920,10 @@ export default function Home() {
       setProgressNoticeVisible(true);
       setProgressiveJob((current) => (current ? {
         ...current,
-        stage: `正在优先生成 ${clockShort(target)} 附近的双语字幕`,
+        stage: `Prioritizing dual subtitles around ${clockShort(target)}`,
         priorityTime: target,
       } : current));
-      setStatusMessage(`已定位到 ${clockShort(target)}，正在优先生成这里及后续字幕，完成前保持暂停。`);
+      setStatusMessage(`Moved to ${clockShort(target)}. Subtitles here and immediately after it are now prioritized; playback will remain paused until they are ready.`);
       return;
     }
 
@@ -2970,8 +3017,8 @@ export default function Home() {
       videoRef.current?.pause();
       setIsPlaying(false);
       setStatusMessage(pendingPrioritySeek
-        ? `正在优先生成 ${clockShort(pendingPrioritySeek.time)} 附近的字幕，完成前保持暂停。`
-        : '当前位置的双语字幕尚未生成，播放保持暂停。');
+        ? `Prioritizing subtitles around ${clockShort(pendingPrioritySeek.time)}. Playback will remain paused until they are ready.`
+        : 'Dual subtitles at this position have not been generated yet. Playback will remain paused.');
       return;
     }
     if (videoRef.current && mediaUrl) {
@@ -3397,8 +3444,60 @@ export default function Home() {
         </div>
       </header>
       <input ref={mediaInputRef} className="sr-only" type="file" multiple accept="video/*,audio/*,.mkv,.mov,.webm,.mp4,.mp3,.wav" onChange={handleMediaImport} />
+      <input ref={libraryMediaInputRef} className="sr-only" type="file" multiple accept="video/*,audio/*,.mkv,.mov,.webm,.mp4,.mp3,.wav" onChange={handleLibraryMediaImport} />
       <input ref={sidecarInputRef} className="sr-only" type="file" accept=".srt,.vtt,.ass,.ssa,text/plain" onChange={handleSidecarImport} />
       <input ref={batchInputRef} className="sr-only" type="file" accept=".json,.csv,.txt,video/*,audio/*" multiple onChange={handleBatchImport} />
+
+      {duplicateImportNotice ? (
+        <div className="duplicate-import-notice" role="alert">
+          <AlertTriangle size={18} aria-hidden="true" />
+          <span>{duplicateImportNotice}</span>
+          <IconButton label="Dismiss duplicate video notice" icon={X} onClick={() => setDuplicateImportNotice('')} />
+        </div>
+      ) : null}
+
+      {!processing && libraryProgressItem?.status === 'processing' ? (
+        <div className="processing-overlay" role="status" aria-live="polite">
+          <div className="processing-card">
+            <div className="processing-spinner" aria-hidden="true"><AudioWaveform size={30} /></div>
+            <h2>Processing your video</h2>
+            <p className="processing-file">{libraryProgressItem.name}</p>
+            <div className="processing-bar">
+              <div className="processing-bar-fill" style={{ width: `${libraryProgressItem.progress || 0}%` }} />
+            </div>
+            <p className="processing-stage">
+              {libraryProgressItem.stage || 'Working'}
+              {` · ${libraryProgressItem.progress || 0}%`}
+            </p>
+            <ol className="processing-steps">
+              <li className={(libraryProgressItem.progress || 0) > 10 ? 'done' : 'active'}>Extract audio</li>
+              <li className={(libraryProgressItem.progress || 0) >= 70
+                ? 'done'
+                : (libraryProgressItem.progress || 0) > 10 ? 'active' : ''}
+              >
+                Transcribe {libraryProgressItem.sourceLanguage === 'detect'
+                  ? '(auto-detect)'
+                  : `(${sourceLangLabel(libraryProgressItem.sourceLanguage || sourceLang)})`}
+              </li>
+              <li className={(libraryProgressItem.progress || 0) >= 100
+                ? 'done'
+                : (libraryProgressItem.progress || 0) >= 70 ? 'active' : ''}
+              >
+                Translate to {languageLabel(libraryProgressItem.translatedTo || targetLang)}
+              </li>
+            </ol>
+            <div className="processing-long-note">
+              <strong>Running from Your library</strong>
+              <span>You can close this progress view and subtitle generation will continue in the background.</span>
+            </div>
+            <div className="processing-actions">
+              <button type="button" className="secondary-action" onClick={() => setLibraryProgressItemId(null)}>
+                Continue in background
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {processing ? (
         <div className="processing-overlay" role="status" aria-live="polite">
@@ -3417,43 +3516,43 @@ export default function Home() {
             {processingKind === 'full' && progressiveJob?.isLong ? (
               <div className="processing-long-note">
                 <strong>
-                  {allowSourceOnlyPlayback ? '原文字幕先行已开启' : '由于视频较长，将先生成约 1 分钟内容'}
+                  {allowSourceOnlyPlayback ? 'Source subtitles first is on' : 'This is a long video, so the first minute will be generated first'}
                 </strong>
                 <span>
                   {allowSourceOnlyPlayback
-                    ? '首段原文识别完成后即可播放，中文翻译会继续在后台逐批补上。'
-                    : `首段约占整体进度 ${Math.max(1, Math.ceil(
+                    ? 'You can start watching as soon as the first source-language segment is transcribed. Translations will be added in batches in the background.'
+                    : `The first segment is about ${Math.max(1, Math.ceil(
                     ((progressiveJob.firstSegmentSeconds || PROGRESSIVE_FIRST_SEGMENT_SECONDS)
                       / Math.max(1, progressiveJob.duration || duration)) * 100,
-                  ))}%。完成后会根据实际生成速度计算安全缓冲；启动阶段按 1、1、2 分钟识别，之后按 3 分钟一段继续生成。`}
+                  ))}% of the video. Once it is ready, LingoLoop will calculate a safe playback buffer from the actual generation speed. Startup segments are 1, 1, and 2 minutes long, followed by 3-minute segments.`}
                 </span>
               </div>
             ) : null}
             {processingKind === 'full' && progressiveStartDecision ? (
               <div className="progressive-start-choice">
                 <strong>
-                  {progressiveStartDecision.mode === 'smooth' ? '正在等待流畅播放缓冲' : '首段已经生成，可以开始观看'}
+                  {progressiveStartDecision.mode === 'smooth' ? 'Waiting for a smooth playback buffer' : 'The first segment is ready to watch'}
                 </strong>
                 <span>
-                  当前生成速度约为播放速度的 {progressiveStartDecision.generationRate.toFixed(2)} 倍；
-                  建议先生成到 {clockShort(progressiveStartDecision.targetBufferSeconds)}。
+                  Generation is running at about {progressiveStartDecision.generationRate.toFixed(2)}× playback speed.
+                  We recommend waiting until {clockShort(progressiveStartDecision.targetBufferSeconds)} is ready.
                   {progressiveStartDecision.estimatedWaitSeconds > 1
-                    ? ` 预计还需等待约 ${clockShort(progressiveStartDecision.estimatedWaitSeconds)}。`
-                    : ' 当前安全缓冲已经充足。'}
+                    ? ` Estimated wait: ${clockShort(progressiveStartDecision.estimatedWaitSeconds)}.`
+                    : ' The playback buffer is ready.'}
                 </span>
                 <div className="progressive-start-actions">
                   {progressiveStartDecision.mode === 'choose' ? (
                     <>
                       <button type="button" className="primary-action" onClick={() => chooseProgressiveStart('smooth')}>
-                        等待流畅播放
+                        Wait for smooth playback
                       </button>
                       <button type="button" className="secondary-action" onClick={() => chooseProgressiveStart('immediate')}>
-                        立即开始
+                        Start now
                       </button>
                     </>
                   ) : (
                     <button type="button" className="secondary-action" onClick={() => chooseProgressiveStart('immediate')}>
-                      改为立即开始
+                      Start now instead
                     </button>
                   )}
                 </div>
@@ -3478,9 +3577,9 @@ export default function Home() {
             )}
             <div className="processing-actions">
               {progressiveJob?.generatedRanges?.length ? (
-                <button type="button" className="secondary-action" onClick={pauseProcessing}>暂停并保留进度</button>
+                <button type="button" className="secondary-action" onClick={pauseProcessing}>Pause and save progress</button>
               ) : null}
-              <button type="button" className="secondary-action" onClick={cancelProcessing}>结束生成</button>
+              <button type="button" className="secondary-action" onClick={cancelProcessing}>Stop generation</button>
             </div>
           </div>
         </div>
@@ -3519,7 +3618,7 @@ export default function Home() {
         <section className="config-flow" aria-label="Configure">
           <div className="config-card">
             <IconButton
-              label="关闭生成配置"
+              label="Close subtitle setup"
               icon={X}
               className="config-close-button"
               disabled={processing || transcribing || translationRunning}
@@ -3632,7 +3731,7 @@ export default function Home() {
                   {progressiveIncomplete && !progressNoticeVisible ? (
                     <>
                       <IconButton
-                        label={`显示后台生成进度：已生成至 ${clockShort(progressiveJob.processedThrough)}，${progressiveJob.percent}%`}
+                        label={`Show background generation progress: ready through ${clockShort(progressiveJob.processedThrough)}, ${progressiveJob.percent}% complete`}
                         icon={Clock}
                         active
                         className="progressive-status-toggle"
@@ -3641,13 +3740,13 @@ export default function Home() {
                       <button
                         type="button"
                         className={`compact-progressive-status ${compactProgressState.kind}`}
-                        aria-label={`后台生成状态：${compactProgressState.label}，${progressiveJob.percent || 0}%，已生成至 ${clockShort(progressiveJob.processedThrough)}`}
+                        aria-label={`Background generation status: ${compactProgressState.label}, ${progressiveJob.percent || 0}% complete, ready through ${clockShort(progressiveJob.processedThrough)}`}
                         onClick={showProgressNotice}
                       >
                         <i aria-hidden="true" />
                         <span>{compactProgressState.label}</span>
                         <strong>{progressiveJob.percent || 0}%</strong>
-                        <span className="compact-progress-through">至 {clockShort(progressiveJob.processedThrough)}</span>
+                        <span className="compact-progress-through">to {clockShort(progressiveJob.processedThrough)}</span>
                       </button>
                     </>
                   ) : null}
@@ -3673,33 +3772,33 @@ export default function Home() {
                 <div className="progressive-playback-status" role="status" aria-live="polite">
                   <span>
                     {pendingPrioritySeek
-                      ? `正在优先生成 ${clockShort(pendingPrioritySeek.time)} 附近及之后的字幕；当前自适应翻译并发 ${adaptiveTranslationConcurrency}`
+                      ? `Prioritizing subtitles around and after ${clockShort(pendingPrioritySeek.time)} · adaptive translation concurrency: ${adaptiveTranslationConcurrency}`
                       : progressiveJob.active
-                      ? `已生成至 ${clockShort(progressiveJob.processedThrough)}，前方缓冲 ${clockShort(bufferAheadSeconds)}${progressiveBufferLow ? '（缓冲偏低）' : ''}；${progressiveJob.stage}`
+                      ? `Ready through ${clockShort(progressiveJob.processedThrough)} · ${clockShort(bufferAheadSeconds)} buffered ahead${progressiveBufferLow ? ' (buffer running low)' : ''} · ${progressiveJob.stage}`
                       : progressiveJob.paused
-                        ? `${progressiveJob.pausing ? '正在安全暂停' : '后台生成已暂停'}，当前可播放到 ${clockShort(progressiveJob.processedThrough)}；恢复点 ${clockShort(progressiveJob.resumeFromSeconds || 0)}`
-                        : `后台生成已停止，当前可播放到 ${clockShort(progressiveJob.processedThrough)}`}
+                        ? `${progressiveJob.pausing ? 'Pausing safely' : 'Background generation paused'} · playable through ${clockShort(progressiveJob.processedThrough)} · resume from ${clockShort(progressiveJob.resumeFromSeconds || 0)}`
+                        : `Background generation stopped · playable through ${clockShort(progressiveJob.processedThrough)}`}
                   </span>
                   <div>
                     <strong>{progressiveJob.percent}%</strong>
                     {progressiveJob.active ? (
                       <>
-                        <IconButton label="暂停并保留生成进度" icon={Pause} onClick={pauseProcessing} />
-                        <IconButton label="结束后台生成" icon={Square} onClick={cancelProcessing} />
+                        <IconButton label="Pause and save generation progress" icon={Pause} onClick={pauseProcessing} />
+                        <IconButton label="Stop background generation" icon={Square} onClick={cancelProcessing} />
                       </>
                     ) : progressiveJob.paused ? (
                       <>
                         <IconButton
-                          label={progressiveJob.pausing ? '正在等待安全暂停点' : '继续生成字幕'}
+                          label={progressiveJob.pausing ? 'Waiting for a safe pause point' : 'Resume subtitle generation'}
                           icon={Play}
                           disabled={progressiveJob.pausing || transcribing || translationRunning}
                           onClick={resumeProcessing}
                         />
-                        <IconButton label="结束后台生成" icon={Square} onClick={cancelProcessing} />
+                        <IconButton label="Stop background generation" icon={Square} onClick={cancelProcessing} />
                       </>
                     ) : null}
                     <IconButton
-                      label="隐藏生成进度提示"
+                      label="Hide generation progress"
                       icon={X}
                       className="progress-notice-hide"
                       onClick={hideProgressNotice}
@@ -3742,7 +3841,7 @@ export default function Home() {
                       const stopAt = Math.max(0, (activeRange?.end || playableThrough) - 0.1);
                       video.currentTime = stopAt;
                       setIsPlaying(false);
-                      setStatusMessage(`已播放到当前生成区间末尾 ${clockShort(stopAt)}，后续字幕仍在后台生成。`);
+                      setStatusMessage(`You have reached the end of the generated section at ${clockShort(stopAt)}. More subtitles are still being generated in the background.`);
                     }
                     playbackTimeRef.current = video.currentTime;
                     setPlaybackTime(video.currentTime);
@@ -3758,15 +3857,15 @@ export default function Home() {
                       event.currentTarget.pause();
                       setIsPlaying(false);
                       setStatusMessage(pendingPrioritySeek
-                        ? `正在优先生成 ${clockShort(pendingPrioritySeek.time)} 附近的字幕，完成前保持暂停。`
-                        : '当前位置的双语字幕尚未生成，播放保持暂停。');
+                        ? `Prioritizing subtitles around ${clockShort(pendingPrioritySeek.time)}. Playback will remain paused until they are ready.`
+                        : 'Dual subtitles at this position have not been generated yet. Playback will remain paused.');
                       return;
                     }
                     if (progressiveIncomplete && activeRange
                       && event.currentTarget.currentTime >= activeRange.end - 0.1) {
                       event.currentTarget.pause();
                       setIsPlaying(false);
-                      setStatusMessage(`后续内容仍在生成中，当前区间可播放到 ${clockShort(activeRange.end)}。`);
+                      setStatusMessage(`Later subtitles are still being generated. This section is playable through ${clockShort(activeRange.end)}.`);
                       return;
                     }
                     playbackTimeRef.current = event.currentTarget.currentTime;
@@ -3810,8 +3909,8 @@ export default function Home() {
                 <div className="priority-seek-waiting" role="status" aria-live="polite">
                   <Clock size={18} />
                   <div>
-                    <strong>正在优先生成 {clockShort(pendingPrioritySeek.time)} 附近字幕</strong>
-                    <span>当前小批次完成后会优先处理这里；若 Whisper 尚未识别到此处则继续等待，字幕准备好前视频保持暂停。</span>
+                    <strong>Prioritizing subtitles around {clockShort(pendingPrioritySeek.time)}</strong>
+                    <span>This position will be processed after the current batch. If Whisper has not reached it yet, generation will continue until it does; playback will remain paused until the subtitles are ready.</span>
                   </div>
                 </div>
               ) : null}
@@ -3847,7 +3946,7 @@ export default function Home() {
                 >
                   <h2><span>{activeCue.original}</span></h2>
                   {activeCue.translationPending ? (
-                    <small className="source-only-translation-status">原文可用 · 中文翻译正在追赶</small>
+                    <small className="source-only-translation-status">Source available · translation catching up</small>
                   ) : (
                     <h3><span>{activeCue.translation}</span></h3>
                   )}
@@ -3988,7 +4087,7 @@ export default function Home() {
                   disabled={transcribing}
                   onChange={() => setAllowSourceOnlyPlayback((value) => !value)}
                 />
-                <span><strong>原文字幕先行</strong><small>网络慢时先播放 Whisper 原文，中文翻译完成后自动补上。</small></span>
+                <span><strong>Source subtitles first</strong><small>On slower connections, start with the Whisper source text. Translations are added automatically as they finish.</small></span>
               </label>
               <div className="performance-note">
                 <FastForward size={16} />
@@ -4138,7 +4237,7 @@ export default function Home() {
               <button type="button" className="icon-button" aria-label="Close library" onClick={() => setLibraryOpen(false)}><X size={18} /></button>
             </div>
             <div className="library-actions">
-              <button type="button" className="secondary-action" title="Add more videos — you can select several at once" onClick={() => mediaInputRef.current?.click()}>
+              <button type="button" className="secondary-action" title="Add more videos — you can select several at once" onClick={() => libraryMediaInputRef.current?.click()}>
                 <Plus size={16} /><span>Add videos</span>
               </button>
               <button
@@ -4168,16 +4267,24 @@ export default function Home() {
                       className={`library-item ${item.status}${item.id === activeItemId ? ' active' : ''}`}
                       disabled={transcribing && item.id !== activeItemId}
                       title={transcribing && item.id !== activeItemId
-                        ? '当前长视频仍在后台生成字幕，完成或停止后可切换视频'
+                        ? 'Subtitles for the current long video are still being generated. Finish or stop generation before switching videos.'
                         : `Open ${item.name}`}
-                      onClick={() => { selectLibraryItem(item); setLibraryOpen(false); }}
+                      onClick={() => {
+                        if (item.status === 'processing') {
+                          setLibraryProgressItemId(item.id);
+                          setLibraryOpen(false);
+                          return;
+                        }
+                        selectLibraryItem(item);
+                        setLibraryOpen(false);
+                      }}
                     >
                       <Film size={16} />
                       <span className="library-item-name">{item.name}</span>
                       <small>
                         {item.status === 'processing' ? `${item.progress}% · ${item.stage}`
                           : item.status === 'done' ? 'Subtitles ready — click to watch'
-                            : item.status === 'partial' ? `已生成至 ${clockShort(item.progressiveJob?.processedThrough || 0)} — 可继续观看`
+                            : item.status === 'partial' ? `Ready through ${clockShort(item.progressiveJob?.processedThrough || 0)} — continue watching`
                             : item.status === 'failed' ? `Failed: ${item.error}`
                               : 'Waiting — no subtitles yet'}
                       </small>
@@ -4539,7 +4646,7 @@ export default function Home() {
                       disabled={transcribing}
                       onChange={() => setAllowSourceOnlyPlayback((value) => !value)}
                     />
-                    <span><strong>原文字幕先行</strong><small>网络慢时先开放 Whisper 原文，中文翻译会在后台原位补全。</small></span>
+                    <span><strong>Source subtitles first</strong><small>On slower connections, make the Whisper source text available first. Translations will fill in automatically in the background.</small></span>
                   </label>
                   <div className="performance-note">
                     <FastForward size={16} />
